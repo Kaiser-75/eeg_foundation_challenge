@@ -25,3 +25,11 @@ The challenge data (HBN-EEG L100) is hosted on S3.
 - AWS CLI  
   ```bash
   pip install awscli
+  # Create directories
+mkdir -p E:\EEG_foundation\competition_data\R1
+mkdir -p E:\EEG_foundation\competition_data\R2
+
+# Download (20 subjects per release; BDF format)
+aws s3 cp --recursive s3://nmdatasets/NeurIPS25/R1_mini_L100_bdf E:\EEG_foundation\competition_data\R1 --no-sign-request
+aws s3 cp --recursive s3://nmdatasets/NeurIPS25/R2_mini_L100_bdf E:\EEG_foundation\competition_data\R2 --no-sign-request
+

@@ -33,7 +33,7 @@ aws s3 cp --recursive s3://nmdatasets/NeurIPS25/R1_mini_L100_bdf E:\EEG_foundati
 ```bash
 aws s3 cp --recursive s3://nmdatasets/NeurIPS25/R2_mini_L100_bdf E:\EEG_foundation\competition_data\R2 --no-sign-request
 ```
-# Note: Miniset consists of R1-R11 where R5 is val set; R12 is not available which is test set
+Note: Miniset consists of R1-R11 where R5 is val set; R12 is not available which is test set
 # Point code to the data root
 $env:EEG_BASE_DIR="E:\EEG_foundation\competition_data"
 

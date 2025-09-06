@@ -23,8 +23,9 @@ mkdir -p E:\EEG_foundation\competition_data\R1
 mkdir -p E:\EEG_foundation\competition_data\R2
 ```
 
-# Download (no credentials needed)
-```bash pip install awscli
+# Download dataset
+```bash
+pip install awscli
 ```
 ```bash
 aws s3 cp --recursive s3://nmdatasets/NeurIPS25/R1_mini_L100_bdf E:\EEG_foundation\competition_data\R1 --no-sign-request

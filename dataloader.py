@@ -277,7 +277,7 @@ class SuSWindowDataset(Dataset):
         return self.subjects_for_file[file_idx]
 
 # =============================================================================
-# CCD helpers — strict GT from feedback
+# CCD helpers 
 # =============================================================================
 def _find_ccd_files(base_dir: Path) -> List[Path]:
     pats = [
@@ -515,3 +515,4 @@ class CCDWindowDataset(Dataset):
     def get_subject(self, k: int) -> str:
         file_idx, *_ = self.index[k]
         return self.subjects_for_file[file_idx]
+

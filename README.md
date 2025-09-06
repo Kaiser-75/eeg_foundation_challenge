@@ -5,7 +5,7 @@ All data is processed to **129 channels × 200 samples** (2 s @ 100 Hz).
 
 ---
 
-## 1) Install (one line)
+## 1) Install requirements
 
 ```bash
 pip install -r requirements.txt
@@ -20,13 +20,10 @@ mkdir -p E:\EEG_foundation\competition_data\R1
 mkdir -p E:\EEG_foundation\competition_data\R2
 
 # Download (no credentials needed)
-```pip install awscli
+```pip install awscli```
+```aws s3 cp --recursive s3://nmdatasets/NeurIPS25/R1_mini_L100_bdf E:\EEG_foundation\competition_data\R1 --no-sign-request
 ```
-```
-aws s3 cp --recursive s3://nmdatasets/NeurIPS25/R1_mini_L100_bdf E:\EEG_foundation\competition_data\R1 --no-sign-request
-```
-```
-aws s3 cp --recursive s3://nmdatasets/NeurIPS25/R2_mini_L100_bdf E:\EEG_foundation\competition_data\R2 --no-sign-request
+```aws s3 cp --recursive s3://nmdatasets/NeurIPS25/R2_mini_L100_bdf E:\EEG_foundation\competition_data\R2 --no-sign-request
 ```
 
 # Point code to the data root

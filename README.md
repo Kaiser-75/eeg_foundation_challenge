@@ -16,13 +16,22 @@ Adjust the destination path if needed. The code expects your base folder in EEG_
 
 Windows PowerShell
 # Create folders
-```mkdir -p E:\EEG_foundation\competition_data\R1```
-```mkdir -p E:\EEG_foundation\competition_data\R2```
+```bash
+mkdir -p E:\EEG_foundation\competition_data\R1
+```
+```bash
+mkdir -p E:\EEG_foundation\competition_data\R2
+```
 
 # Download (no credentials needed)
-```pip install awscli```
-```aws s3 cp --recursive s3://nmdatasets/NeurIPS25/R1_mini_L100_bdf E:\EEG_foundation\competition_data\R1 --no-sign-request```
-```aws s3 cp --recursive s3://nmdatasets/NeurIPS25/R2_mini_L100_bdf E:\EEG_foundation\competition_data\R2 --no-sign-request```
+```bash pip install awscli
+```
+```bash
+aws s3 cp --recursive s3://nmdatasets/NeurIPS25/R1_mini_L100_bdf E:\EEG_foundation\competition_data\R1 --no-sign-request
+```
+```bash
+aws s3 cp --recursive s3://nmdatasets/NeurIPS25/R2_mini_L100_bdf E:\EEG_foundation\competition_data\R2 --no-sign-request
+```
 
 # Point code to the data root
 $env:EEG_BASE_DIR="E:\EEG_foundation\competition_data"

@@ -1,4 +1,3 @@
-# train_clr.py
 from __future__ import annotations
 import os
 import math
@@ -10,9 +9,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
 
+from braindecode.models import EEGNetv4
 from dataloader import SuSWindowDataset, PreprocessConfig, MAX_CH, OUT_T
-from models import EEGEncoder
 
 # =========================
 # HYPERPARAMETERS (edit here)
@@ -24,21 +24,21 @@ STRIDE_SEC            = 1.0           # SSL window stride (sec)
 
 EPOCHS                = 10
 BATCH_SIZE            = 64
-LR                   = 1e-3
+LR                    = 1e-3
 WEIGHT_DECAY          = 1e-4
-EMB_DIM               = 128           # encoder embedding size
+EMB_DIM               = 128           # encoder embedding size (also EEGNetv4 n_outputs)
 PROJ_DIM              = 128           # projection head size
 TEMP                  = 0.2           # NT-Xent temperature
 LAMBDA_T              = 1.0           # weight for temporal contrastive loss
 LAMBDA_S              = 1.0           # weight for spatial contrastive loss
-MAX_STEPS_PER_EPOCH   = None          # 500/2000 or None to use full epoch
+MAX_STEPS_PER_EPOCH   = None       # 500/2000 or None to use full epoch
 LOG_EVERY             = 100
 SAVE_DIR              = Path("checkpoints")
 SEED                  = 42
 
-NUM_WORKERS           = 8             
+NUM_WORKERS           = 8
 PERSISTENT_WORKERS    = True
-PREFETCH_FACTOR       = 4             
+PREFETCH_FACTOR       = 4
 
 # =========================
 # Utilities
@@ -66,12 +66,32 @@ def cosine_lr(optimizer, base_lr: float, epochs: int, steps_per_epoch: int, warm
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 # =========================
+# EEGNetv4-backed encoder
+# =========================
+class EEGV4Encoder(nn.Module):
+    """
+    Wrap EEGNetv4 so that it outputs an embedding vector of size EMB_DIM.
+    We set n_outputs=EMB_DIM and use logits as features.
+    """
+    def __init__(self, in_ch: int = MAX_CH, T: int = OUT_T, emb: int = EMB_DIM):
+        super().__init__()
+        self.backbone = EEGNetv4(
+            n_chans=in_ch,
+            n_outputs=emb,             # logits size = embedding size
+            n_times=T,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # EEGNetv4 expects [B, C, T]; returns [B, emb]
+        return self.backbone(x)
+
+# =========================
 # SimCLR
 # =========================
 class SimCLR(nn.Module):
     def __init__(self, in_ch: int = MAX_CH, T: int = OUT_T, emb: int = EMB_DIM, proj: int = PROJ_DIM):
         super().__init__()
-        self.encoder = EEGEncoder(in_ch=in_ch, T=T, hid=256, emb=emb)
+        self.encoder = EEGV4Encoder(in_ch=in_ch, T=T, emb=emb)
         self.projector = nn.Sequential(
             nn.Linear(emb, emb, bias=False),
             nn.BatchNorm1d(emb),
@@ -86,7 +106,7 @@ class SimCLR(nn.Module):
         return h, z
 
 # =========================
-# Augmentations (GPU-safe)
+# Augmentations
 # =========================
 def rand_time_shift(x: torch.Tensor, max_shift: int = 10) -> torch.Tensor:
     if max_shift <= 0:
@@ -141,28 +161,23 @@ def make_spatial_views(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return v1, v2
 
 # =========================
-# NT-Xent loss (stable in fp32)
+# NT-Xent loss (compute in fp32, mask with -inf)
 # =========================
 def nt_xent_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = TEMP) -> torch.Tensor:
-    """
-    Symmetric NT-Xent across 2B embeddings.
-    Compute similarities in float32 to avoid fp16 overflow under autocast.
-    """
-    z1 = F.normalize(z1, dim=-1)
-    z2 = F.normalize(z2, dim=-1)
-    z = torch.cat([z1, z2], dim=0)                           # [2B, D]
-    sim = (z.float() @ z.float().T) / float(temperature)     # [2B, 2B] fp32
-    sim.fill_diagonal_(float("-inf"))                        # mask self-similarity
+    z1 = F.normalize(z1.float(), dim=-1)
+    z2 = F.normalize(z2.float(), dim=-1)
+    z = torch.cat([z1, z2], dim=0)                       # [2B, D], fp32
+    sim = (z @ z.T) / float(temperature)                 # [2B, 2B], fp32
+    sim.fill_diagonal_(-float("inf"))                    # avoid fp16 overflow
     B = z1.shape[0]
     targets = torch.arange(B, device=z.device)
-    targets = torch.cat([targets + B, targets], dim=0)       # [2B]
+    targets = torch.cat([targets + B, targets], dim=0)   # [2B]
     return F.cross_entropy(sim, targets)
 
 # =========================
 # DataLoader (custom collate)
 # =========================
 def collate_unlabeled(batch):
-    # batch: List[Tuple[tensor, None]] -> Tensor [B, C, T]
     xs = [b[0] if isinstance(b, (list, tuple)) else b for b in batch]
     return torch.stack(xs, dim=0)
 
@@ -181,16 +196,18 @@ def build_loader(base_dir: Path, batch_size: int, releases=None, max_files=None,
         stride_sec=stride,
         verbose="INFO",
     )
-    loader = DataLoader(
-        ds,
+    dl_kwargs = dict(
         batch_size=batch_size,
-        shuffle=True,                               # randomness handled here (augmentations add more)
-        num_workers=NUM_WORKERS,                    
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available(),
         drop_last=True,
-        persistent_workers=PERSISTENT_WORKERS and (NUM_WORKERS > 0),
-        prefetch_factor=(PREFETCH_FACTOR if NUM_WORKERS > 0 else None),
+        persistent_workers=(PERSISTENT_WORKERS and NUM_WORKERS > 0),
         collate_fn=collate_unlabeled,
     )
+    if NUM_WORKERS > 0:
+        dl_kwargs["prefetch_factor"] = PREFETCH_FACTOR
+    loader = DataLoader(ds, **dl_kwargs)
     return ds, loader
 
 # =========================
@@ -219,11 +236,9 @@ def train():
     steps_per_epoch = len(loader) if MAX_STEPS_PER_EPOCH is None else min(len(loader), MAX_STEPS_PER_EPOCH)
     scheduler = cosine_lr(optimizer, base_lr=LR, epochs=EPOCHS, steps_per_epoch=steps_per_epoch, warmup_epochs=1)
 
-    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
-
+    scaler = GradScaler(enabled=(device.type == "cuda"))
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
-    global_step = 0
     model.train()
     for ep in range(1, EPOCHS + 1):
         running = {"temp": 0.0, "spat": 0.0, "total": 0.0}
@@ -237,7 +252,7 @@ def train():
             Xt1, Xt2 = make_temporal_views(X)
             Xs1, Xs2 = make_spatial_views(X)
 
-            with torch.amp.autocast(device_type="cuda", enabled=(device.type == "cuda")):
+            with autocast(enabled=(device.type == "cuda")):
                 _, zt1 = model(Xt1)
                 _, zt2 = model(Xt2)
                 _, zs1 = model(Xs1)
@@ -256,7 +271,6 @@ def train():
             running["temp"]  += loss_t.item()
             running["spat"]  += loss_s.item()
             running["total"] += loss.item()
-            global_step += 1
 
             if it % LOG_EVERY == 0 or it == 1:
                 lr = scheduler.get_last_lr()[0]
@@ -274,7 +288,8 @@ def train():
             "hparams": {
                 "emb": EMB_DIM, "proj": PROJ_DIM, "temp": TEMP,
                 "lambda_t": LAMBDA_T, "lambda_s": LAMBDA_S,
-                "batch_size": BATCH_SIZE, "lr": LR, "weight_decay": WEIGHT_DECAY
+                "batch_size": BATCH_SIZE, "lr": LR, "weight_decay": WEIGHT_DECAY,
+                "backbone": "EEGNetv4",
             },
         }
         torch.save(ckpt, SAVE_DIR / f"simclr_sus_epoch{ep:03d}.pt")

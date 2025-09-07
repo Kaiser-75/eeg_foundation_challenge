@@ -1,133 +1,190 @@
-# models.py
 from __future__ import annotations
 from dataclasses import dataclass
+from typing import Literal, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# braindecode backbones
+from braindecode.models import EEGNetv4, AttentionBaseNet
 
+# Challenge I/O sizes
+MAX_CH: int = 129
+OUT_T:  int = 200   # 2.0 s @ 100 Hz
 
-def kaiming_init_(m: nn.Module) -> None:
-    # Use ReLU gain for conv/linear so it works even if 'gelu' is unsupported
-    if isinstance(m, (nn.Conv1d, nn.Linear)):
+# ------------------------------------------------------------
+# Small helpers
+# ------------------------------------------------------------
+def _kaiming_(m: nn.Module):
+    if isinstance(m, (nn.Conv1d, nn.Conv2d, nn.Linear)):
         nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
-        if getattr(m, "bias", None) is not None and m.bias is not None:
-            nn.init.zeros_(m.bias)
-    elif isinstance(m, nn.BatchNorm1d):
-        if getattr(m, "weight", None) is not None and m.weight is not None:
-            nn.init.ones_(m.weight)
-        if getattr(m, "bias", None) is not None and m.bias is not None:
-            nn.init.zeros_(m.bias)
-    elif isinstance(m, nn.LayerNorm):
-        if getattr(m, "weight", None) is not None and m.weight is not None:
-            nn.init.ones_(m.weight)
-        if getattr(m, "bias", None) is not None and m.bias is not None:
+        if getattr(m, "bias", None) is not None:
             nn.init.zeros_(m.bias)
 
-class ConvBNAct(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, k: int, s: int = 1, p: int | None = None, g: int = 1):
+# ------------------------------------------------------------
+# Backbones (encoders): produce an embedding vector of size `emb`
+# ------------------------------------------------------------
+class EEGV4Encoder(nn.Module):
+    """
+    EEGNetv4 as an encoder: we set n_classes=emb so its final linear
+    produces the representation directly.
+    """
+    def __init__(self, in_ch: int = MAX_CH, T: int = OUT_T, emb: int = 128):
         super().__init__()
-        if p is None:
-            p = k // 2
-        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, groups=g, bias=False)
-        self.bn = nn.BatchNorm1d(out_ch)
-        self.act = nn.GELU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.bn(self.conv(x)))
-
-class DWSeparableBlock(nn.Module):
-    """
-    Depthwise separable 1D conv block with residual.
-    x -> DWConv(k, s) -> BN -> GELU -> PWConv(1x1) -> BN -> GELU -> +res
-    """
-    def __init__(self, ch: int, out_ch: int, k: int = 7, s: int = 1):
-        super().__init__()
-        self.dw = ConvBNAct(ch, ch, k=k, s=s, g=ch)        # depthwise
-        self.pw = ConvBNAct(ch, out_ch, k=1, s=1, p=0)     # pointwise
-        self.res = None
-        if s != 1 or ch != out_ch:
-            self.res = nn.Sequential(
-                nn.Conv1d(ch, out_ch, kernel_size=1, stride=s, bias=False),
-                nn.BatchNorm1d(out_ch),
-            )
-        self.act = nn.GELU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.pw(self.dw(x))
-        r = x if self.res is None else self.res(x)
-        return self.act(y + r)
-
-# ---------------------------
-# Encoder
-# ---------------------------
-
-@dataclass
-class EEGEncoderCfg:
-    in_ch: int = 129
-    T: int = 200
-    stem_ch: int = 128
-    width_mult: float = 1.0
-    dropout: float = 0.1
-    mlp_hidden: int = 256
-    emb: int = 128
-
-class EEGEncoder(nn.Module):
-    """
-    Compact EEG encoder for 2s windows at 100 Hz (C=129, T=200).
-    Pure Conv1d, depthwise separable blocks, global pool → MLP.
-    """
-    def __init__(self, in_ch: int = 129, T: int = 200, hid: int = 256, emb: int = 128):
-        super().__init__()
-        width = 1.0
-        c1 = int(128 * width)
-        c2 = int(192 * width)
-        c3 = int(256 * width)
-        c4 = int(256 * width)
-
-        self.stem = ConvBNAct(in_ch, c1, k=7, s=1)
-        self.block1 = DWSeparableBlock(c1, c1, k=7, s=1)   # T -> T
-        self.block2 = DWSeparableBlock(c1, c2, k=5, s=2)   # T -> T/2
-        self.block3 = DWSeparableBlock(c2, c3, k=5, s=2)   # T/2 -> T/4
-        self.block4 = DWSeparableBlock(c3, c4, k=5, s=1)   # T/4 -> T/4
-
-        self.dropout = nn.Dropout(p=0.1)
-
-        self.head = nn.Sequential(
-            nn.Linear(c4, hid, bias=False),
-            nn.LayerNorm(hid),
-            nn.GELU(),
-            nn.Linear(hid, emb, bias=True),
-            nn.LayerNorm(emb),
+        self.emb = int(emb)
+        self.backbone = EEGNetv4(
+            in_chans=in_ch,
+            n_classes=self.emb,               # treat as feature dim
+            input_window_samples=T,
         )
 
-        self.apply(kaiming_init_)
+    @property
+    def out_dim(self) -> int:
+        return self.emb
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [B, 129, 200] -> z: [B, emb]
-        """
-        assert x.dim() == 3, f"EEGEncoder expects [B, C, T], got {tuple(x.shape)}"
-        y = self.stem(x)
-        y = self.block1(y)
-        y = self.block2(y)
-        y = self.block3(y)
-        y = self.block4(y)
-        y = self.dropout(y)
-        y = y.mean(dim=-1)      # global avg pool over time
-        z = self.head(y)        # [B, emb]
+        # x: [B, C, T]; EEGNetv4 internally handles shape via Ensure4d
+        return self.backbone(x)  # [B, emb]
+
+
+class AttentionBaseEncoder(nn.Module):
+    """
+    AttentionBaseNet encoder: set n_outputs=emb so the classifier is the feature map.
+    """
+    def __init__(self, in_ch: int = MAX_CH, T: int = OUT_T, emb: int = 128, sfreq: float = 100.0):
+        super().__init__()
+        self.emb = int(emb)
+        self.backbone = AttentionBaseNet(
+            n_times=T,
+            n_chans=in_ch,
+            n_outputs=self.emb,              # treat as feature dim
+            sfreq=sfreq,
+            # keep the rest at defaults; you can tune if needed
+        )
+
+    @property
+    def out_dim(self) -> int:
+        return self.emb
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(x)  # [B, emb]
+
+
+class SimpleCNNEncoder(nn.Module):
+    """
+    Lightweight 1D CNN over time with channel mixing (works directly on [B, C, T]).
+    """
+    def __init__(self, in_ch: int = MAX_CH, T: int = OUT_T, emb: int = 128, drop: float = 0.1):
+        super().__init__()
+        self.emb = int(emb)
+        self.net = nn.Sequential(
+            nn.Conv1d(in_ch, 128, kernel_size=7, padding=3, bias=False),
+            nn.BatchNorm1d(128), nn.GELU(),
+            nn.MaxPool1d(2),                      # 200 -> 100
+            nn.Dropout(drop),
+
+            nn.Conv1d(128, 256, kernel_size=5, padding=2, bias=False),
+            nn.BatchNorm1d(256), nn.GELU(),
+            nn.MaxPool1d(2),                      # 100 -> 50
+            nn.Dropout(drop),
+
+            nn.Conv1d(256, 256, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(256), nn.GELU(),
+            nn.AdaptiveAvgPool1d(1),              # -> [B, 256, 1]
+        )
+        self.proj = nn.Linear(256, self.emb)
+        self.apply(_kaiming_)
+
+    @property
+    def out_dim(self) -> int:
+        return self.emb
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, T]
+        h = self.net(x).squeeze(-1)  # [B, 256]
+        z = self.proj(h)             # [B, emb]
         return z
 
-# ---------------------------
-# Utilities
-# ---------------------------
 
-def count_parameters(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+# ------------------------------------------------------------
+# Heads for supervised transfer (RT regression + HIT classification)
+# ------------------------------------------------------------
+class RTHead(nn.Module):
+    """Small MLP → single scalar (regression)."""
+    def __init__(self, in_dim: int, hid: int = 128, drop: float = 0.1):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hid), nn.GELU(),
+            nn.Dropout(drop),
+            nn.Linear(hid, 1),
+        )
+        self.apply(_kaiming_)
 
-if __name__ == "__main__":
-    enc = EEGEncoder(in_ch=129, T=200, hid=256, emb=128)
-    x = torch.randn(8, 129, 200)
-    z = enc(x)
-    print("Output shape:", z.shape)  # [8, 128]
-    print("Params (M):", count_parameters(enc) / 1e6)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(x).squeeze(-1)  # [B]
+
+
+class HitHead(nn.Module):
+    """Binary logit (for BCEWithLogitsLoss)."""
+    def __init__(self, in_dim: int, hid: int = 128, drop: float = 0.1):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hid), nn.GELU(),
+            nn.Dropout(drop),
+            nn.Linear(hid, 1),
+        )
+        self.apply(_kaiming_)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(x).squeeze(-1)  # [B] logit
+
+
+# ------------------------------------------------------------
+# Unified backbone
+# ------------------------------------------------------------
+BackboneName = Literal["eegnetv4", "attention", "simplecnn"]
+
+@dataclass
+class BackboneConfig:
+    name: BackboneName = "eegnetv4"
+    in_ch: int = MAX_CH
+    T: int = OUT_T
+    emb: int = 128
+    sfreq: float = 100.0  # only used by AttentionBase
+
+def make_backbone(cfg: BackboneConfig) -> nn.Module:
+    if cfg.name == "eegnetv4":
+        return EEGV4Encoder(in_ch=cfg.in_ch, T=cfg.T, emb=cfg.emb)
+    if cfg.name == "attention":
+        return AttentionBaseEncoder(in_ch=cfg.in_ch, T=cfg.T, emb=cfg.emb, sfreq=cfg.sfreq)
+    if cfg.name == "simplecnn":
+        return SimpleCNNEncoder(in_ch=cfg.in_ch, T=cfg.T, emb=cfg.emb)
+    raise ValueError(f"Unknown backbone: {cfg.name}")
+
+class EEGTransferModel(nn.Module):
+    """
+    Backbone (feature extractor) + two heads:
+      - RT regression (scalar)
+      - HIT classification (binary logit)
+    """
+    def __init__(self, backbone: nn.Module, head_hid: int = 128, drop: float = 0.1):
+        super().__init__()
+        self.backbone = backbone
+        emb = getattr(backbone, "out_dim", None)
+        if emb is None:
+            raise ValueError("Backbone must define `out_dim` property.")
+        self.rt_head = RTHead(emb, hid=head_hid, drop=drop)
+        self.hit_head = HitHead(emb, hid=head_hid, drop=drop)
+
+    @property
+    def feature_dim(self) -> int:
+        return self.backbone.out_dim
+
+    def forward(self, x: torch.Tensor):
+        feat = self.backbone(x)      # [B, emb]
+        rt   = self.rt_head(feat)    # [B]
+        hit  = self.hit_head(feat)   # [B] logit
+        return {"feat": feat, "rt": rt, "hit": hit}

@@ -1,4 +1,3 @@
-# train_supervised.py — Finetune SimCLR encoder on CCD (RT + Hit)
 from __future__ import annotations
 import os, math
 from pathlib import Path
@@ -14,36 +13,31 @@ from torch.utils.data import DataLoader, Dataset
 
 from sklearn.metrics import roc_auc_score, balanced_accuracy_score, r2_score, mean_absolute_error
 
-from dataloader import (
-    CCDWindowDataset, PreprocessConfig, MAX_CH, OUT_T
-)
-from models import EEGEncoder
+from braindecode.models import EEGNetv4  
+from dataloader import CCDWindowDataset, PreprocessConfig, MAX_CH, OUT_T
 
 # =========================
 # Hyperparameters (edit here)
 # =========================
 BASE_DIR            = Path(os.environ.get("EEG_BASE_DIR", "competition_data"))
-PRETRAINED_CKPT     = Path("checkpoints/simclr_sus_latest.pt")   # or a specific epoch ckpt
+PRETRAINED_CKPT     = Path("checkpoints/simclr_sus_latest.pt")
 SAVE_DIR            = Path("checkpoints_ccd")
 
-# releases per org guidance (train: all except R5; val: R5; test: R12 if present)
 TRAIN_RELEASES      = ["R1","R2","R3","R4","R6","R7","R8","R9","R10","R11"]
 VAL_RELEASES        = ["R5"]
-TEST_RELEASES       = ["R12"]   # likely absent locally; handled if empty
+TEST_RELEASES       = ["R12"]   # optional; ignored if not present
 
-# dataset options
-CCD_MODE            = "pretrial"    # "pretrial" | "poststim" | "both"
-PRELOAD             = False         # keep False on Windows to reduce memory
+CCD_MODE            = "poststim"    # "pretrial" | "poststim"
+PRELOAD             = False
 
-# loaders
 BATCH_SIZE          = 128
-NUM_WORKERS         = 8           
+NUM_WORKERS         = 8
 PIN_MEMORY          = torch.cuda.is_available()
 PERSISTENT_WORKERS  = True
 PREFETCH_FACTOR     = 4
 
 # model / heads
-EMB_DIM             = 128           # must match SimCLR encoder emb size
+EMB_DIM             = 128           # must match SimCLR n_outputs
 HID_FC              = 256
 DROPOUT             = 0.10
 
@@ -95,13 +89,13 @@ def collate_supervised(batch):
         xs.append(x)
         rts.append(y["rt"])
         hits.append(y["hit"])
-    X = torch.stack(xs, dim=0)      # [B, C, T]
-    rt = torch.stack(rts, dim=0)    # [B]
-    hit = torch.stack(hits, dim=0)  # [B]
+    X = torch.stack(xs, dim=0)                 # [B, C, T]
+    rt = torch.stack(rts, dim=0).float()       # [B]
+    hit = torch.stack(hits, dim=0).long()      # [B]
     return X, {"rt": rt, "hit": hit}
 
 # =========================
-# Data / splits (subject-wise)
+# Data / splits
 # =========================
 def make_cfg() -> PreprocessConfig:
     return PreprocessConfig(
@@ -139,12 +133,11 @@ def build_subject_split(ds: CCDWindowDataset, train_subjects: set[str], val_subj
 def build_loaders() -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
     cfg = make_cfg()
 
-    # Build three datasets filtered by releases (they share the same transforms)
     ds_train = CCDWindowDataset(base_dir=BASE_DIR, releases=TRAIN_RELEASES, mode=CCD_MODE,
                                 preprocess=cfg, preload=PRELOAD, verbose="INFO")
     ds_val   = CCDWindowDataset(base_dir=BASE_DIR, releases=VAL_RELEASES, mode=CCD_MODE,
                                 preprocess=cfg, preload=PRELOAD, verbose="INFO")
-    # Test don't exist now
+
     try:
         ds_test = CCDWindowDataset(base_dir=BASE_DIR, releases=TEST_RELEASES, mode=CCD_MODE,
                                    preprocess=cfg, preload=PRELOAD, verbose="INFO")
@@ -153,12 +146,10 @@ def build_loaders() -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
     except Exception:
         ds_test = None
 
-    # Subject IDs per split (unique sets)
     train_subjects = {ds_train.get_subject(k) for k in range(len(ds_train))}
     val_subjects   = {ds_val.get_subject(k)   for k in range(len(ds_val))}
     test_subjects  = {ds_test.get_subject(k) for k in range(len(ds_test))} if ds_test is not None else set()
 
-    # Merge into one dataset (so workers/memory are shared) and split by subject IDs
     ds_all = CCDWindowDataset(base_dir=BASE_DIR, releases=TRAIN_RELEASES + VAL_RELEASES + (TEST_RELEASES if ds_test else []),
                               mode=CCD_MODE, preprocess=cfg, preload=PRELOAD, verbose="ERROR")
 
@@ -183,10 +174,19 @@ def build_loaders() -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
     return train_loader, val_loader, test_loader
 
 # =========================
-# Model: encoder + two heads
+# Encoder (EEGNetv4) + heads
 # =========================
+class EEGV4Encoder(nn.Module):
+    """EEGNetv4 that outputs a feature vector of size EMB_DIM (we use logits as features)."""
+    def __init__(self, in_ch: int = MAX_CH, T: int = OUT_T, emb: int = EMB_DIM):
+        super().__init__()
+        # Newer braindecode prefers n_chans / n_outputs / n_times
+        self.backbone = EEGNetv4(n_chans=in_ch, n_outputs=emb, n_times=T)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(x)  # [B, EMB_DIM]
+
 class CCDHead(nn.Module):
-    """Two-head MLP: regression (RT) and classification (Hit)."""
     def __init__(self, emb: int = EMB_DIM, hid: int = HID_FC, dropout: float = DROPOUT):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -194,8 +194,8 @@ class CCDHead(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
         )
-        self.out_rt  = nn.Linear(hid, 1)  # regression
-        self.out_hit = nn.Linear(hid, 2)  # logits for {0,1}
+        self.out_rt  = nn.Linear(hid, 1)
+        self.out_hit = nn.Linear(hid, 2)
 
     def forward(self, h: torch.Tensor) -> Dict[str, torch.Tensor]:
         x = self.mlp(h)
@@ -206,20 +206,29 @@ class CCDHead(nn.Module):
 class CCDModel(nn.Module):
     def __init__(self, in_ch: int = MAX_CH, T: int = OUT_T, emb: int = EMB_DIM):
         super().__init__()
-        self.backbone = EEGEncoder(in_ch=in_ch, T=T, hid=256, emb=emb)
+        self.backbone = EEGV4Encoder(in_ch=in_ch, T=T, emb=emb)
         self.heads = CCDHead(emb=emb, hid=HID_FC, dropout=DROPOUT)
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        h = self.backbone(x)         # [B, EMB_DIM]
+        h = self.backbone(x)
         return self.heads(h)
 
 def load_simclr_encoder_weights(model: CCDModel, ckpt_path: Path) -> Tuple[List[str], List[str]]:
-    """Load SimCLR encoder weights into model.backbone (ignore projector)."""
+    """
+    Load EEGNetv4 weights from a SimCLR checkpoint saved with keys like:
+      'encoder.backbone.<EEGNetv4_param_name>'
+    into:
+      model.backbone.backbone.<EEGNetv4_param_name>
+    """
     sd = torch.load(ckpt_path, map_location="cpu")
     state = sd.get("model", sd)
-    enc = {k.replace("encoder.", ""): v for k, v in state.items() if k.startswith("encoder.")}
-    missing = model.backbone.load_state_dict(enc, strict=False)
-    # torch returns a NamedTuple in newer versions; make readable lists
+
+    sub = {k.replace("encoder.backbone.", ""): v
+           for k, v in state.items() if k.startswith("encoder.backbone.")}
+
+    # Load into the *inner* EEGNetv4 module
+    missing = model.backbone.backbone.load_state_dict(sub, strict=False)
+    # normalize return to lists for printing
     if isinstance(missing, tuple) and len(missing) == 2:
         miss, unexp = list(missing[0]), list(missing[1])
     else:
@@ -237,7 +246,7 @@ class BatchOut:
     y_rt: torch.Tensor
     y_hit: torch.Tensor
     p_rt: torch.Tensor
-    p_hit: torch.Tensor  # probabilities for class 1
+    p_hit: torch.Tensor
 
 def estimate_class_weights(loader: DataLoader, max_batches: int = 10) -> torch.Tensor:
     pos = 0
@@ -251,8 +260,8 @@ def estimate_class_weights(loader: DataLoader, max_batches: int = 10) -> torch.T
     if total == 0:
         return torch.tensor([1.0, 1.0], dtype=torch.float32)
     neg = total - pos
-    w_pos = neg / total if total > 0 else 0.5
-    w_neg = pos / total if total > 0 else 0.5
+    w_pos = neg / total
+    w_neg = pos / total
     return torch.tensor([w_neg, w_pos], dtype=torch.float32)
 
 def step_supervised(model: CCDModel, batch, class_weights: torch.Tensor, device: torch.device) -> BatchOut:
@@ -265,7 +274,7 @@ def step_supervised(model: CCDModel, batch, class_weights: torch.Tensor, device:
     p_rt = out["rt"]
     logit = out["hit_logit"]
 
-    loss_rt = F.l1_loss(p_rt, y_rt)  # MAE
+    loss_rt = F.l1_loss(p_rt, y_rt)
     cw = class_weights.to(device)
     loss_hit = F.cross_entropy(logit, y_hit, weight=cw)
 
@@ -304,22 +313,20 @@ def train():
     device = get_device()
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Data
     train_loader, val_loader, test_loader = build_loaders()
     print(f"[data] train steps/epoch: {len(train_loader)} | val steps: {len(val_loader)}" +
           (f" | test steps: {len(test_loader)}" if test_loader is not None else ""))
 
-    # Class weights 
     class_weights = estimate_class_weights(train_loader, max_batches=10)
 
     # Model
     model = CCDModel(in_ch=MAX_CH, T=OUT_T, emb=EMB_DIM).to(device)
     miss, unexp = load_simclr_encoder_weights(model, PRETRAINED_CKPT)
-    print(f"[ckpt] loaded SimCLR → backbone | missing={len(miss)} unexpected={len(unexp)}")
+    print(f"[ckpt] loaded SimCLR(EEGNetv4) → backbone | missing={len(miss)} unexpected={len(unexp)}")
 
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
-    # ---- Stage 1: Linear probe (freeze encoder) ----
+    # ---- Stage 1: Linear probe
     for p in model.backbone.parameters():
         p.requires_grad = False
 
@@ -354,7 +361,7 @@ def train():
             best_mae = val["mae"]
             torch.save({"model": model.state_dict(), "epoch": ep, "stage": 1, "val": val}, SAVE_DIR / "ccd_best_linear.pt")
 
-    # ---- Stage 2: Finetune (unfreeze encoder with smaller LR) ----
+    # ---- Stage 2: Finetune
     for p in model.backbone.parameters():
         p.requires_grad = True
 
@@ -366,7 +373,7 @@ def train():
     sch = cosine_lr(opt, base_lr=LR_FT_HEADS, epochs=EPOCHS_FT, steps_per_epoch=len(train_loader), warmup_epochs=WARMUP_EPOCHS)
 
     print(f"[stage2] finetune for {EPOCHS_FT} epochs")
-    best_score = float("inf")  # composite for keeping best
+    best_score = float("inf")
     for ep in range(1, EPOCHS_FT + 1):
         model.train()
         run = {"loss":0.0, "rt":0.0, "hit":0.0}
@@ -390,16 +397,16 @@ def train():
         val = evaluate(model, val_loader, device)
         print(f"[stage2][val] ep {ep:02d} | MAE {val['mae']:.4f} | R2 {val['r2']:.3f} | AUC {val['auc']:.3f} | BAcc {val['bacc']:.3f}")
 
-        # approximate challenge score (lower better)
+        # simple composite for checkpointing
         score = 0.4*val["mae"] + 0.2*(1.0 - max(0.0, min(1.0, val["r2"]))) + 0.3*(1.0 - val["auc"]) + 0.1*(1.0 - val["bacc"])
         if score < best_score:
             best_score = score
             state = {"model": model.state_dict(), "epoch": ep, "stage": 2, "val": val}
+            SAVE_DIR.mkdir(parents=True, exist_ok=True)
             torch.save(state, SAVE_DIR / "ccd_best_finetune.pt")
             torch.save(state, SAVE_DIR / "ccd_latest.pt")
             print(f"[ckpt] saved best at ep {ep:02d} → {SAVE_DIR/'ccd_best_finetune.pt'}")
 
-    # optional test
     if test_loader is not None:
         best_state = torch.load(SAVE_DIR / "ccd_best_finetune.pt", map_location=device)
         model.load_state_dict(best_state["model"])
@@ -407,10 +414,8 @@ def train():
         print(f"[test] MAE {test['mae']:.4f} | R2 {test['r2']:.3f} | AUC {test['auc']:.3f} | BAcc {test['bacc']:.3f}")
 
 if __name__ == "__main__":
-    
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     torch.set_num_threads(8)
     torch.set_num_interop_threads(8)
-
     train()

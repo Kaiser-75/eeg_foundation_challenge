@@ -17,10 +17,10 @@ Adjust the destination path if needed. The code expects your base folder in EEG_
 Windows PowerShell
 # Create folders
 ```bash
-mkdir -p E:\EEG_foundation\competition_data\R1
+mkdir -p competition_data/R1
 ```
 ```bash
-mkdir -p E:\EEG_foundation\competition_data\R2
+mkdir -p competition_data/R2
 ```
 
 # Download dataset
@@ -28,10 +28,10 @@ mkdir -p E:\EEG_foundation\competition_data\R2
 pip install awscli
 ```
 ```bash
-aws s3 cp --recursive s3://nmdatasets/NeurIPS25/R1_mini_L100_bdf E:\EEG_foundation\competition_data\R1 --no-sign-request
+aws s3 cp --recursive s3://nmdatasets/NeurIPS25/R1_mini_L100_bdf competition_data/R1 --no-sign-request
 ```
 ```bash
-aws s3 cp --recursive s3://nmdatasets/NeurIPS25/R2_mini_L100_bdf E:\EEG_foundation\competition_data\R2 --no-sign-request
+aws s3 cp --recursive s3://nmdatasets/NeurIPS25/R2_mini_L100_bdf competition_data/R2 --no-sign-request
 ```
 Note: Miniset consists of R1-R11 where R5 is val set; R12 is not available which is test set
 # Point code to the data root

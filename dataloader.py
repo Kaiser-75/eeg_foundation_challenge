@@ -42,7 +42,7 @@ class PreprocessConfig:
     resample_hz: float = OUT_HZ
 
     # Window-level post steps
-    amp_clip_uv: Optional[float] = 200.0
+    amp_clip_uv: Optional[float] = 600.0
     window_standardize: bool = True  # per-window, per-channel z-score
 
 # =============================================================================
@@ -515,4 +515,5 @@ class CCDWindowDataset(Dataset):
     def get_subject(self, k: int) -> str:
         file_idx, *_ = self.index[k]
         return self.subjects_for_file[file_idx]
+
 

@@ -40,7 +40,7 @@ PROJ_DIM              = 128           # projector/predictor hidden/output
 MOMENTUM_BASE         = 0.996         # start EMA; will smoothly → 1.0
 
 # Loader perf
-NUM_WORKERS           = 8
+NUM_WORKERS           = 22
 PERSISTENT_WORKERS    = True
 PREFETCH_FACTOR       = 4
 PIN_MEMORY            = torch.cuda.is_available()

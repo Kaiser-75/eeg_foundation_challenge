@@ -3,35 +3,36 @@ import os
 import math
 from pathlib import Path
 from typing import Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
+
 from braindecode.models import EEGNetv4
-from dataloader import SuSWindowDataset, PreprocessConfig, MAX_CH, OUT_T
+from dataloader import SuSWindowDataset, PreprocessConfig, MAX_CH, OUT_HZ
 
 # =========================
 # HYPERPARAMETERS (edit here)
 # =========================
-BASE_DIR              = Path(os.environ.get("EEG_BASE_DIR", "competition_data"))  # root that contains R1..R11
+BASE_DIR              = Path(os.environ.get("EEG_BASE_DIR", "competition_data"))
 RELEASES              = None          # e.g. ["R1","R2"] or None for all
-MAX_FILES             = None          # cap number of recordings, or None
-STRIDE_SEC            = 3.0           # SSL window stride (sec)
+MAX_FILES             = None          # e.g. 500 to cap number of recordings, or None
+WIN_SEC               = 6.0           # SSL window length (seconds) on SuS
+STRIDE_SEC            = 3.0           # SSL window stride (seconds)
 
 EPOCHS                = 10
 BATCH_SIZE            = 64
 LR                    = 1e-3
 WEIGHT_DECAY          = 1e-4
-
-EMB_DIM               = 128           # encoder embedding size (also EEGNetv4 n_outputs)
+EMB_DIM               = 128           # encoder embedding size (EEGNetv4 n_outputs)
 PROJ_DIM              = 128           # projection head size
 TEMP                  = 0.2           # NT-Xent temperature
 LAMBDA_T              = 1.0           # weight for temporal contrastive loss
 LAMBDA_S              = 1.0           # weight for spatial contrastive loss
-
-MAX_STEPS_PER_EPOCH   = None          # e.g., 2000 for quick runs; None = full epoch
+MAX_STEPS_PER_EPOCH   = None          # cap steps/epoch (e.g., 2000) or None
 LOG_EVERY             = 100
 SAVE_DIR              = Path("checkpoints_c1")
 SEED                  = 42
@@ -67,30 +68,29 @@ def cosine_lr(optimizer, base_lr: float, epochs: int, steps_per_epoch: int, warm
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 # =========================
-# EEGNetv4-backed encoder
+# EEGNetv4-backed encoder 
 # =========================
 class EEGV4Encoder(nn.Module):
     """
-    Wrap EEGNetv4 so that it outputs an embedding vector of size EMB_DIM.
-    We set n_outputs=EMB_DIM and use logits as features.
+    Wrap EEGNetv4, outputting a [B, EMB_DIM] embedding.
+    If the backbone leaves a residual time axis (e.g., [B, EMB_DIM, t']),
+    we global-average over time to get [B, EMB_DIM].
     """
-    def __init__(self, in_ch: int = MAX_CH, T: int = OUT_T, emb: int = EMB_DIM):
+    def __init__(self, in_ch: int, T: int, emb: int):
         super().__init__()
-        self.backbone = EEGNetv4(
-            n_chans=in_ch,
-            n_outputs=emb,             # logits size = embedding size
-            n_times=T,
-        )
+        self.backbone = EEGNetv4(n_chans=in_ch, n_outputs=emb, n_times=T)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # EEGNetv4 expects [B, C, T]; returns [B, emb]
-        return self.backbone(x)
+        h = self.backbone(x)            # [B, emb] or [B, emb, t']
+        if h.ndim == 3:
+            h = h.mean(-1)              # global average over time
+        return h
 
 # =========================
 # SimCLR
 # =========================
 class SimCLR(nn.Module):
-    def __init__(self, in_ch: int = MAX_CH, T: int = OUT_T, emb: int = EMB_DIM, proj: int = PROJ_DIM):
+    def __init__(self, in_ch: int, T: int, emb: int, proj: int):
         super().__init__()
         self.encoder = EEGV4Encoder(in_ch=in_ch, T=T, emb=emb)
         self.projector = nn.Sequential(
@@ -162,14 +162,14 @@ def make_spatial_views(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return v1, v2
 
 # =========================
-# NT-Xent loss (compute in fp32, mask with -inf)
+# NT-Xent loss (fp32 logits; diagonal masked)
 # =========================
 def nt_xent_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = TEMP) -> torch.Tensor:
     z1 = F.normalize(z1.float(), dim=-1)
     z2 = F.normalize(z2.float(), dim=-1)
-    z = torch.cat([z1, z2], dim=0)                       # [2B, D], fp32
-    sim = (z @ z.T) / float(temperature)                 # [2B, 2B], fp32
-    sim.fill_diagonal_(-float("inf"))                    # avoid self-contrast
+    z = torch.cat([z1, z2], dim=0)                       # [2B, D]
+    sim = (z @ z.T) / float(temperature)                 # [2B, 2B]
+    sim.fill_diagonal_(-float("inf"))
     B = z1.shape[0]
     targets = torch.arange(B, device=z.device)
     targets = torch.cat([targets + B, targets], dim=0)   # [2B]
@@ -179,27 +179,27 @@ def nt_xent_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = TEMP) 
 # DataLoader (custom collate)
 # =========================
 def collate_unlabeled(batch):
-    # Works whether dataset returns X or (X, None)
     xs = [b[0] if isinstance(b, (list, tuple)) else b for b in batch]
     return torch.stack(xs, dim=0)
 
-def build_loader(base_dir: Path, batch_size: int, releases=None, max_files=None, stride: float = 1.0):
+def build_loader(base_dir: Path, batch_size: int, releases=None, max_files=None,
+                 stride: float = 1.0, win_sec: float = 6.0):
     cfg = PreprocessConfig(
         l_freq=0.5, h_freq=40.0, line_freq=60, notch=True, avg_ref=True,
         resample_hz=100.0,
-        amp_clip_uv=600.0,       
-        window_standardize=True,
+        amp_clip_uv=600.0, window_standardize=True,
     )
     ds = SuSWindowDataset(
         base_dir=base_dir,
         releases=releases,
         max_files=max_files,
         preprocess=cfg,
-        preload=False,           # enable if you have tons of RAM and want speed
+        preload=False,
         stride_sec=stride,
+        win_sec=win_sec,
         verbose="INFO",
     )
-    kwargs = dict(
+    dl_kwargs = dict(
         batch_size=batch_size,
         shuffle=True,
         num_workers=NUM_WORKERS,
@@ -209,8 +209,8 @@ def build_loader(base_dir: Path, batch_size: int, releases=None, max_files=None,
         collate_fn=collate_unlabeled,
     )
     if NUM_WORKERS > 0:
-        kwargs["prefetch_factor"] = PREFETCH_FACTOR
-    loader = DataLoader(ds, **kwargs)
+        dl_kwargs["prefetch_factor"] = PREFETCH_FACTOR
+    loader = DataLoader(ds, **dl_kwargs)
     return ds, loader
 
 # =========================
@@ -229,17 +229,22 @@ def train():
         releases=RELEASES,
         max_files=MAX_FILES,
         stride=STRIDE_SEC,
+        win_sec=WIN_SEC,
     )
 
-    print(f"[C1] SimCLR SSL on SuS | windows={len(ds)} | device={device.type}")
+    # Set n_times from actual dataset window length (e.g., 6s * 100Hz = 600)
+    T_model = int(round(getattr(ds, "win_sec", WIN_SEC) * getattr(ds.cfg, "resample_hz", OUT_HZ)))
 
-    model = SimCLR(in_ch=MAX_CH, T=OUT_T, emb=EMB_DIM, proj=PROJ_DIM).to(device)
+    print(f"[SuSWindowDataset] files={len(ds.files)}  win={ds.win_sec:.1f}s stride={ds.stride:.1f}s")
+    print(f"[C1] SimCLR SSL on SuS | windows={len(ds)} | T_model={T_model} | device={device.type}")
+
+    model = SimCLR(in_ch=MAX_CH, T=T_model, emb=EMB_DIM, proj=PROJ_DIM).to(device)
     optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
     steps_per_epoch = len(loader) if MAX_STEPS_PER_EPOCH is None else min(len(loader), MAX_STEPS_PER_EPOCH)
     scheduler = cosine_lr(optimizer, base_lr=LR, epochs=EPOCHS, steps_per_epoch=steps_per_epoch, warmup_epochs=1)
 
-    scaler = GradScaler("cuda", enabled=(device.type == "cuda"))
+    scaler = GradScaler(enabled=(device.type == "cuda"))
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
     model.train()
@@ -249,13 +254,13 @@ def train():
             if MAX_STEPS_PER_EPOCH is not None and it > MAX_STEPS_PER_EPOCH:
                 break
 
-            X = X.to(device, non_blocking=True)  # [B, 129, T]
+            X = X.to(device, non_blocking=True)
 
             # two kinds of positive pairs
             Xt1, Xt2 = make_temporal_views(X)
             Xs1, Xs2 = make_spatial_views(X)
 
-            with autocast("cuda", enabled=(device.type == "cuda")):
+            with autocast(device_type="cuda", enabled=(device.type == "cuda")):
                 _, zt1 = model(Xt1)
                 _, zt2 = model(Xt2)
                 _, zs1 = model(Xs1)
@@ -283,23 +288,30 @@ def train():
                 print(f"epoch {ep:02d} | step {it:05d}/{steps_per_epoch:05d} | "
                       f"lr {lr:.3e} | temp {avg_t:.4f} | spat {avg_s:.4f} | total {avg_total:.4f}")
 
-        # Save encoder-only convenience checkpoint for supervised fine-tuning
-        encoder_only = {"encoder.backbone." + k: v for k, v in model.encoder.backbone.state_dict().items()}
+        # ---- Save checkpoint ----
         ckpt = {
             "epoch": ep,
-            "model": {**model.state_dict(), **encoder_only},
+            "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "hparams": {
                 "emb": EMB_DIM, "proj": PROJ_DIM, "temp": TEMP,
                 "lambda_t": LAMBDA_T, "lambda_s": LAMBDA_S,
                 "batch_size": BATCH_SIZE, "lr": LR, "weight_decay": WEIGHT_DECAY,
-                "backbone": "EEGNetv4",
+                "backbone": "EEGNetv4", "win_sec": WIN_SEC, "stride_sec": STRIDE_SEC, "T_model": T_model,
             },
         }
-        SAVE_DIR.mkdir(parents=True, exist_ok=True)
+        (SAVE_DIR).mkdir(parents=True, exist_ok=True)
         torch.save(ckpt, SAVE_DIR / f"simclr_sus_epoch{ep:03d}.pt")
         torch.save(ckpt, SAVE_DIR / "simclr_sus_latest.pt")
+
+        # (Optional) save a tiny encoder-only file for supervised finetune convenience
+        enc_only = {}
+        for k, v in model.state_dict().items():
+            if k.startswith("encoder.backbone."):
+                enc_only[k] = v
+        torch.save({"model": enc_only}, SAVE_DIR / "simclr_encoder_only.pt")
+
         print(f"[ckpt] saved → {SAVE_DIR / f'simclr_sus_epoch{ep:03d}.pt'}")
 
     print("Training complete.")
@@ -308,10 +320,9 @@ def train():
 # Main
 # =========================
 if __name__ == "__main__":
+    # keep thread usage predictable on CPU ops (IO/preproc)
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     torch.set_num_threads(8)
     torch.set_num_interop_threads(8)
     train()
-
-

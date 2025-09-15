@@ -60,6 +60,6 @@ $env:EEG_BASE_DIR="E:\EEG_foundation\competition_data"
 # train_supervised.py
 -Loads the SSL encoder; trains linear probe and/or finetunes end-to-end on CCD.
 
--Metrics: RT (MAE/R²), HIT (AUC/BAcc).
+-Target: RT (They excluded Hit/Miss)
 
 

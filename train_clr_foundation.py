@@ -2,48 +2,60 @@ from __future__ import annotations
 import os
 import math
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Dict, List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from torch.amp import autocast, GradScaler
+
+from torch.cuda.amp import autocast, GradScaler
 
 from braindecode.models import EEGNetv4
-from dataloader import SuSWindowDataset, PreprocessConfig, MAX_CH, OUT_HZ
+from dataloader_c2 import (
+    make_ssl_dataset,
+    PreprocessConfig,
+    MAX_CH,
+    OUT_T,
+)
 
 # =========================
-# HYPERPARAMETERS (edit here)
+# HYPERPARAMETERS
 # =========================
 BASE_DIR              = Path(os.environ.get("EEG_BASE_DIR", "competition_data"))
-RELEASES              = None          # e.g. ["R1","R2"] or None for all
-MAX_FILES             = None          # e.g. 500 to cap number of recordings, or None
-WIN_SEC               = 6.0           # SSL window length (seconds) on SuS
-STRIDE_SEC            = 3.0           # SSL window stride (seconds)
-
-EPOCHS                = 100
-BATCH_SIZE            = 64
+RELEASES              = None            # e.g., ["R1","R2"] or None for all
+MAX_STEPS_PER_EPOCH   = None            # e.g., 2000 to cap per-epoch steps for debugging; None uses full epoch
+EPOCHS                = 10
+BATCH_SIZE            = 256
 LR                    = 1e-3
 WEIGHT_DECAY          = 1e-4
-EMB_DIM               = 128           # encoder embedding size (EEGNetv4 n_outputs)
-PROJ_DIM              = 128           # projection head size
-TEMP                  = 0.2           # NT-Xent temperature
-LAMBDA_T              = 1.0           # weight for temporal contrastive loss
-LAMBDA_S              = 1.0           # weight for spatial contrastive loss
-MAX_STEPS_PER_EPOCH   = None          # cap steps/epoch (e.g., 2000) or None
-LOG_EVERY             = 100
-SAVE_DIR              = Path("checkpoints_c1")
-SEED                  = 42
 
-NUM_WORKERS           = 22
+# Embedding/projection
+EMB_DIM               = 128             # EEGNetv4 n_outputs (feature dim)
+PROJ_DIM              = 128             # projection head output
+
+# Loss & views
+TEMP                  = 0.2             # NT-Xent temperature
+LAMBDA_TEMPORAL       = 1.0             # weight for temporal view loss
+LAMBDA_SPATIAL        = 1.0             # weight for spatial view loss
+LAMBDA_FFT            = 0.3            # 0 = disable freq-domain view loss; 0.3= mild
+
+# Data & loader
+STRIDE_SEC            = 1.0             # SSL window stride for all tasks
+NUM_WORKERS           = 8
 PERSISTENT_WORKERS    = True
 PREFETCH_FACTOR       = 4
 PIN_MEMORY            = torch.cuda.is_available()
+PRELOAD               = False           # set True for faster reuse (uses host RAM); may explode memory use
+
+# Logging / saving
+LOG_EVERY             = 100
+SAVE_DIR              = Path("checkpoints_foundation")
+SEED                  = 42
 
 # =========================
-# Utilities
+# Utils
 # =========================
 def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -68,29 +80,29 @@ def cosine_lr(optimizer, base_lr: float, epochs: int, steps_per_epoch: int, warm
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 # =========================
-# EEGNetv4-backed encoder 
+# EEGNetv4-backed encoder
 # =========================
 class EEGV4Encoder(nn.Module):
     """
-    Wrap EEGNetv4, outputting a [B, EMB_DIM] embedding.
-    If the backbone leaves a residual time axis (e.g., [B, EMB_DIM, t']),
-    we global-average over time to get [B, EMB_DIM].
+    EEGNetv4 with n_outputs=EMB_DIM; we treat logits as embeddings.
     """
-    def __init__(self, in_ch: int, T: int, emb: int):
+    def __init__(self, in_ch: int = MAX_CH, T: int = OUT_T, emb: int = EMB_DIM):
         super().__init__()
-        self.backbone = EEGNetv4(n_chans=in_ch, n_outputs=emb, n_times=T)
+        self.backbone = EEGNetv4(
+            n_chans=in_ch,
+            n_outputs=emb,
+            n_times=T,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.backbone(x)            # [B, emb] or [B, emb, t']
-        if h.ndim == 3:
-            h = h.mean(-1)              # global average over time
-        return h
+        # x: [B, C, T] -> [B, emb]
+        return self.backbone(x)
 
 # =========================
-# SimCLR
+# SimCLR model
 # =========================
 class SimCLR(nn.Module):
-    def __init__(self, in_ch: int, T: int, emb: int, proj: int):
+    def __init__(self, in_ch: int = MAX_CH, T: int = OUT_T, emb: int = EMB_DIM, proj: int = PROJ_DIM):
         super().__init__()
         self.encoder = EEGV4Encoder(in_ch=in_ch, T=T, emb=emb)
         self.projector = nn.Sequential(
@@ -151,6 +163,20 @@ def channel_jitter(x: torch.Tensor, sigma: float = 0.02) -> torch.Tensor:
     scale = (1.0 + sigma * torch.randn(B, C, 1, device=x.device))
     return x * scale
 
+# Optional frequency-domain perturb (disabled by default via LAMBDA_FFT=0)
+def fft_perturb(x: torch.Tensor, mag_sigma: float = 0.02) -> torch.Tensor:
+    """
+    Simple magnitude jitter in frequency domain; keeps phase, mild spectral augmentation.
+    """
+    B, C, T = x.shape
+    Xf = torch.fft.rfft(x, dim=-1)                          # [B, C, F]
+    mag = Xf.abs()
+    pha = torch.angle(Xf)
+    mag = mag * (1.0 + mag_sigma * torch.randn_like(mag))
+    Xf_new = mag * torch.exp(1j * pha)
+    x_new = torch.fft.irfft(Xf_new, n=T, dim=-1)
+    return x_new.real
+
 def make_temporal_views(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     v1 = add_noise(rand_time_mask(rand_time_shift(x, max_shift=10), max_frac=0.15, num_masks=2), sigma=0.02)
     v2 = add_noise(rand_time_mask(rand_time_shift(x, max_shift=10), max_frac=0.15, num_masks=2), sigma=0.02)
@@ -176,41 +202,38 @@ def nt_xent_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = TEMP) 
     return F.cross_entropy(sim, targets)
 
 # =========================
-# DataLoader (custom collate)
+# DataLoader (simple collate)
 # =========================
 def collate_unlabeled(batch):
-    xs = [b[0] if isinstance(b, (list, tuple)) else b for b in batch]
-    return torch.stack(xs, dim=0)
+    # batch: list[Tensor [C,T]]
+    return torch.stack(batch, dim=0)
 
-def build_loader(base_dir: Path, batch_size: int, releases=None, max_files=None,
-                 stride: float = 1.0, win_sec: float = 6.0):
+def build_loader():
     cfg = PreprocessConfig(
-        l_freq=0.5, h_freq=40.0, line_freq=60, notch=True, avg_ref=True,
-        resample_hz=100.0,
-        amp_clip_uv=600.0, window_standardize=True,
+        l_freq=0.5, h_freq=40.0, line_freq=60, notch=True,
+        avg_ref=True, resample_hz=100.0,
+        amp_clip_uv=800.0, window_standardize=True,
     )
-    ds = SuSWindowDataset(
-        base_dir=base_dir,
-        releases=releases,
-        max_files=max_files,
+    ds = make_ssl_dataset(
+        base_dir=BASE_DIR,
+        releases=RELEASES,
         preprocess=cfg,
-        preload=False,
-        stride_sec=stride,
-        win_sec=win_sec,
+        stride_sec=STRIDE_SEC,
+        preload=PRELOAD,
         verbose="INFO",
     )
-    dl_kwargs = dict(
-        batch_size=batch_size,
+    kwargs = dict(
+        batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=NUM_WORKERS,
         pin_memory=PIN_MEMORY,
         drop_last=True,
-        persistent_workers=(PERSISTENT_WORKERS and NUM_WORKERS > 0),
         collate_fn=collate_unlabeled,
+        persistent_workers=(PERSISTENT_WORKERS and NUM_WORKERS > 0),
     )
     if NUM_WORKERS > 0:
-        dl_kwargs["prefetch_factor"] = PREFETCH_FACTOR
-    loader = DataLoader(ds, **dl_kwargs)
+        kwargs["prefetch_factor"] = PREFETCH_FACTOR
+    loader = DataLoader(ds, **kwargs)
     return ds, loader
 
 # =========================
@@ -219,76 +242,78 @@ def build_loader(base_dir: Path, batch_size: int, releases=None, max_files=None,
 def train():
     set_seed(SEED)
     device = get_device()
+    print(f"[foundation] SSL on all tasks (CCD pretrial only) | device={device.type}")
+    print(f"BASE_DIR = {BASE_DIR.resolve()}")
 
-    base_dir = BASE_DIR.expanduser().resolve()
-    assert base_dir.exists(), f"Base dir not found: {base_dir}"
-
-    ds, loader = build_loader(
-        base_dir=base_dir,
-        batch_size=BATCH_SIZE,
-        releases=RELEASES,
-        max_files=MAX_FILES,
-        stride=STRIDE_SEC,
-        win_sec=WIN_SEC,
-    )
-
-    # Set n_times from actual dataset window length (e.g., 6s * 100Hz = 600)
-    T_model = int(round(getattr(ds, "win_sec", WIN_SEC) * getattr(ds.cfg, "resample_hz", OUT_HZ)))
-
-    print(f"[SuSWindowDataset] files={len(ds.files)}  win={ds.win_sec:.1f}s stride={ds.stride:.1f}s")
-    print(f"[C1] SimCLR SSL on SuS | windows={len(ds)} | T_model={T_model} | device={device.type}")
-
-    model = SimCLR(in_ch=MAX_CH, T=T_model, emb=EMB_DIM, proj=PROJ_DIM).to(device)
-    optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-
+    ds, loader = build_loader()
     steps_per_epoch = len(loader) if MAX_STEPS_PER_EPOCH is None else min(len(loader), MAX_STEPS_PER_EPOCH)
-    scheduler = cosine_lr(optimizer, base_lr=LR, epochs=EPOCHS, steps_per_epoch=steps_per_epoch, warmup_epochs=1)
+    print(f"steps/epoch = {steps_per_epoch} (of {len(loader)})")
 
+    model = SimCLR(in_ch=MAX_CH, T=OUT_T, emb=EMB_DIM, proj=PROJ_DIM).to(device)
+    optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = cosine_lr(optimizer, base_lr=LR, epochs=EPOCHS, steps_per_epoch=steps_per_epoch, warmup_epochs=1)
     scaler = GradScaler(enabled=(device.type == "cuda"))
+
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
     model.train()
+    gstep = 0
     for ep in range(1, EPOCHS + 1):
-        running = {"temp": 0.0, "spat": 0.0, "total": 0.0}
+        running = {"temp": 0.0, "spat": 0.0, "fft": 0.0, "total": 0.0}
         for it, X in enumerate(loader, start=1):
             if MAX_STEPS_PER_EPOCH is not None and it > MAX_STEPS_PER_EPOCH:
                 break
 
-            X = X.to(device, non_blocking=True)
+            X = X.to(device, non_blocking=True)  # [B, C, T]
 
-            # two kinds of positive pairs
+            # make positive pairs
             Xt1, Xt2 = make_temporal_views(X)
             Xs1, Xs2 = make_spatial_views(X)
 
-            with autocast(device_type="cuda", enabled=(device.type == "cuda")):
+            with autocast(enabled=(device.type == "cuda")):
+                # temporal
                 _, zt1 = model(Xt1)
                 _, zt2 = model(Xt2)
+                loss_t = nt_xent_loss(zt1, zt2, temperature=TEMP)
+
+                # spatial
                 _, zs1 = model(Xs1)
                 _, zs2 = model(Xs2)
-
-                loss_t = nt_xent_loss(zt1, zt2, temperature=TEMP)
                 loss_s = nt_xent_loss(zs1, zs2, temperature=TEMP)
-                loss   = LAMBDA_T * loss_t + LAMBDA_S * loss_s
+
+                # frequency-domain view
+                loss_f = torch.tensor(0.0, device=device)
+                if LAMBDA_FFT > 0.0:
+                    Xf1 = fft_perturb(X)
+                    Xf2 = fft_perturb(X)
+                    _, zf1 = model(Xf1)
+                    _, zf2 = model(Xf2)
+                    loss_f = nt_xent_loss(zf1, zf2, temperature=TEMP)
+
+                loss = LAMBDA_TEMPORAL * loss_t + LAMBDA_SPATIAL * loss_s + LAMBDA_FFT * loss_f
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
+            gstep += 1
 
             running["temp"]  += loss_t.item()
             running["spat"]  += loss_s.item()
+            running["fft"]   += (loss_f.item() if isinstance(loss_f, torch.Tensor) else 0.0)
             running["total"] += loss.item()
 
             if it % LOG_EVERY == 0 or it == 1:
                 lr = scheduler.get_last_lr()[0]
                 avg_t = running["temp"] / it
                 avg_s = running["spat"] / it
+                avg_f = running["fft"]  / max(1, it)
                 avg_total = running["total"] / it
                 print(f"epoch {ep:02d} | step {it:05d}/{steps_per_epoch:05d} | "
-                      f"lr {lr:.3e} | temp {avg_t:.4f} | spat {avg_s:.4f} | total {avg_total:.4f}")
+                      f"lr {lr:.3e} | temp {avg_t:.4f} | spat {avg_s:.4f} | fft {avg_f:.4f} | total {avg_total:.4f}")
 
-        # ---- Save checkpoint ----
+        # save checkpoint each epoch
         ckpt = {
             "epoch": ep,
             "model": model.state_dict(),
@@ -296,23 +321,14 @@ def train():
             "scheduler": scheduler.state_dict(),
             "hparams": {
                 "emb": EMB_DIM, "proj": PROJ_DIM, "temp": TEMP,
-                "lambda_t": LAMBDA_T, "lambda_s": LAMBDA_S,
+                "lambda_t": LAMBDA_TEMPORAL, "lambda_s": LAMBDA_SPATIAL, "lambda_fft": LAMBDA_FFT,
                 "batch_size": BATCH_SIZE, "lr": LR, "weight_decay": WEIGHT_DECAY,
-                "backbone": "EEGNetv4", "win_sec": WIN_SEC, "stride_sec": STRIDE_SEC, "T_model": T_model,
+                "backbone": "EEGNetv4",
             },
         }
-        (SAVE_DIR).mkdir(parents=True, exist_ok=True)
-        torch.save(ckpt, SAVE_DIR / f"simclr_sus_epoch{ep:03d}.pt")
-        torch.save(ckpt, SAVE_DIR / "simclr_sus_latest.pt")
-
-        # (Optional) save a tiny encoder-only file for supervised finetune convenience
-        enc_only = {}
-        for k, v in model.state_dict().items():
-            if k.startswith("encoder.backbone."):
-                enc_only[k] = v
-        torch.save({"model": enc_only}, SAVE_DIR / "simclr_encoder_only.pt")
-
-        print(f"[ckpt] saved → {SAVE_DIR / f'simclr_sus_epoch{ep:03d}.pt'}")
+        torch.save(ckpt, SAVE_DIR / f"foundation_simclr_epoch{ep:03d}.pt")
+        torch.save(ckpt, SAVE_DIR / "foundation_simclr_latest.pt")
+        print(f"[ckpt] saved → {SAVE_DIR / f'foundation_simclr_epoch{ep:03d}.pt'}")
 
     print("Training complete.")
 

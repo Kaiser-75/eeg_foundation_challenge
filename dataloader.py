@@ -18,7 +18,7 @@ mne.set_log_level("ERROR")
 # =============================================================================
 MAX_CH: int    = 129           # keep/pad to 129 EEG channels
 OUT_HZ: float  = 100.0         # resample to 100 Hz
-WIN_SEC: float = 2.0           # 2.0-second windows for all tasks
+WIN_SEC: float = 6.0           # 2.0-second windows for all tasks
 OUT_T: int     = int(WIN_SEC * OUT_HZ)   # 200 samples @100 Hz
 
 # Base filters
@@ -515,5 +515,6 @@ class CCDWindowDataset(Dataset):
     def get_subject(self, k: int) -> str:
         file_idx, *_ = self.index[k]
         return self.subjects_for_file[file_idx]
+
 
 

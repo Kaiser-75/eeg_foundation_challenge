@@ -264,5 +264,5 @@ def train():
     steps_per_epoch = len(loader) if MAX_STEPS_PER_EPOCH is None else min(len(loader), MAX_STEPS_PER_EPOCH)
     T_LOCAL = int(round(WIN_SEC_SSL * OUT_HZ))
 
-    print(f"[C1][BYOL] SSL on SuS | windows={len})
+
 

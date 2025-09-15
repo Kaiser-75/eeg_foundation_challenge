@@ -1,23 +1,21 @@
+# train_supervised_c1.py
 from __future__ import annotations
 import os, math
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Tuple, Dict, Optional
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-
 from sklearn.metrics import r2_score, mean_absolute_error
-
 from braindecode.models import EEGNetv4
 from dataloader import CCDWindowDataset, PreprocessConfig, MAX_CH, OUT_T
 
 # =========================
-# Hyperparameters (edit here)
+# Hyperparameters
 # =========================
 BASE_DIR            = Path(os.environ.get("EEG_BASE_DIR", "competition_data"))
 PRETRAINED_CKPT     = Path("checkpoints_c1/simclr_sus_latest.pt")
@@ -27,7 +25,7 @@ TRAIN_RELEASES      = ["R1","R2","R3","R4","R6","R7","R8","R9","R10","R11"]
 VAL_RELEASES        = ["R5"]
 TEST_RELEASES       = ["R12"]
 
-CCD_MODE            = "poststim"   
+CCD_MODE            = "poststim"   # per rules, use stimulus-anchored POST windows (2s)
 
 BATCH_SIZE          = 128
 NUM_WORKERS         = 8
@@ -95,7 +93,7 @@ def make_cfg() -> PreprocessConfig:
     return PreprocessConfig(
         l_freq=0.5, h_freq=40.0, line_freq=60, notch=True,
         avg_ref=True, resample_hz=100.0,
-        amp_clip_uv=600.0, window_standardize=True,  
+        amp_clip_uv=600.0, window_standardize=True,
     )
 
 def build_loaders() -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
@@ -128,7 +126,10 @@ class EEGV4Encoder(nn.Module):
         super().__init__()
         self.backbone = EEGNetv4(n_chans=in_ch, n_outputs=emb, n_times=T)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backbone(x)  # [B, EMB_DIM]
+        h = self.backbone(x)  # usually [B, EMB_DIM], but some versions may output [B, EMB_DIM, t']
+        if h.ndim == 3:
+            h = h.mean(-1)    # safe global average over time
+        return h              # [B, EMB_DIM]
 
 class CCDHeadRT(nn.Module):
     def __init__(self, emb: int = EMB_DIM, hid: int = HID_FC, dropout: float = DROPOUT):
@@ -151,13 +152,29 @@ class CCDModel(nn.Module):
         return self.head(h)  # rt
 
 def load_simclr_encoder_weights(model: CCDModel, ckpt_path: Path):
+    """
+    Loads encoder weights saved by our SSL trainers.
+    Supports the following layouts in ckpt["model"]:
+      - "encoder.backbone.*" (preferred)
+      - "backbone.*"
+      - direct EEGNetv4 state_dict (matching keys)
+    """
     if not ckpt_path.exists():
         print(f"[ckpt] WARNING: {ckpt_path} not found → training from scratch.")
         return
     sd = torch.load(ckpt_path, map_location="cpu")
     state = sd.get("model", sd)
-    sub = {k.replace("encoder.backbone.", ""): v
-           for k, v in state.items() if k.startswith("encoder.backbone.")}
+
+    # Try multiple key styles
+    sub = {k.replace("encoder.backbone.", ""): v for k, v in state.items()
+           if k.startswith("encoder.backbone.")}
+    if not sub:
+        sub = {k.replace("backbone.", ""): v for k, v in state.items()
+               if k.startswith("backbone.")}
+    if not sub and isinstance(state, dict):
+        # maybe it's already the bare EEGNetv4 dict
+        sub = state
+
     missing, unexpected = model.backbone.backbone.load_state_dict(sub, strict=False)
     print(f"[ckpt] loaded backbone | missing={len(missing)} unexpected={len(unexpected)}")
 
@@ -279,5 +296,3 @@ if __name__ == "__main__":
     torch.set_num_threads(8)
     torch.set_num_interop_threads(8)
     train()
-
-

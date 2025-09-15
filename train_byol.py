@@ -2,25 +2,26 @@ from __future__ import annotations
 import os, math
 from pathlib import Path
 from typing import Tuple, Dict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+
 from braindecode.models import EEGNetv4
 from dataloader import SuSWindowDataset, PreprocessConfig, MAX_CH, OUT_HZ
 
 # =========================
-# HYPERPARAMETERS (edit here)
+# HYPERPARAMETERS
 # =========================
 BASE_DIR              = Path(os.environ.get("EEG_BASE_DIR", "competition_data"))
 RELEASES              = None          # e.g. ["R1","R2"] or None for all
-MAX_FILES             = None          # cap files for quick runs (e.g., 500) or None
+MAX_FILES             = None          # cap files for quick runs, or None
 
 # SSL windowing (SuS)
-WIN_SEC_SSL           = 6.0           # 6-second windows for SSL (OK for pretraining)
-STRIDE_SEC            = 3.0           # stride between SSL windows
+WIN_SEC_SSL           = 6.0           # 6 s SSL windows (pretraining is free-form)
+STRIDE_SEC            = 3.0
 
 # Train
 EPOCHS                = 10
@@ -33,18 +34,18 @@ SAVE_DIR              = Path("checkpoints_c1")
 SEED                  = 42
 
 # Model dims
-EMB_DIM               = 128           # EEGNetv4 n_outputs (embedding dim)
-PROJ_DIM              = 128           # projector/predictor hidden/output
+EMB_DIM               = 128           # EEGNetv4 embedding dim
+PROJ_DIM              = 128           # projector/predictor dim
 
-# BYOL momentum (EMA) schedule
-MOMENTUM_BASE         = 0.996         # start EMA; will smoothly → 1.0
+# BYOL momentum (EMA)
+MOMENTUM_BASE         = 0.996         # will smoothly → ~1.0
 
 # Loader perf
 NUM_WORKERS           = 8
 PERSISTENT_WORKERS    = True
 PREFETCH_FACTOR       = 4
 PIN_MEMORY            = torch.cuda.is_available()
-PRELOAD               = False         # set True to cache preprocessed raws (big RAM)
+PRELOAD               = False         # True caches preprocessed raws (needs big RAM)
 
 # =========================
 # Utilities
@@ -159,9 +160,9 @@ class EEGV4Encoder(nn.Module):
         super().__init__()
         self.backbone = EEGNetv4(n_chans=in_ch, n_outputs=emb, n_times=T)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.backbone(x)         # [B, emb] or [B, emb, t']
+        h = self.backbone(x)         # [B, emb] or [B, emb, t′]
         if h.ndim == 3:
-            h = h.mean(-1)           # global avg pool over time if present
+            h = h.mean(-1)           # global avg pool if temporal dim is present
         return h                      # [B, emb]
 
 # =========================
@@ -262,7 +263,92 @@ def train():
 
     ds, loader = build_loader()
     steps_per_epoch = len(loader) if MAX_STEPS_PER_EPOCH is None else min(len(loader), MAX_STEPS_PER_EPOCH)
+
+    # T passed to EEGNet must match the SSL window length at 100 Hz
     T_LOCAL = int(round(WIN_SEC_SSL * OUT_HZ))
+    print(f"[BYOL] SSL on SuS | windows={len(ds)} | win={WIN_SEC_SSL:.1f}s | device={device.type} | T={T_LOCAL}")
 
+    model = BYOL(in_ch=MAX_CH, T=T_LOCAL, emb=EMB_DIM, proj=PROJ_DIM).to(device)
+    optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = cosine_lr(optimizer, base_lr=LR, epochs=EPOCHS, steps_per_epoch=steps_per_epoch, warmup_epochs=1)
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
+    SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
+    model.train()
+    global_step = 0
+    total_steps = (EPOCHS * steps_per_epoch) if steps_per_epoch is not None else EPOCHS * len(loader)
+
+    for ep in range(1, EPOCHS + 1):
+        running = 0.0
+        for it, X in enumerate(loader, start=1):
+            if MAX_STEPS_PER_EPOCH is not None and it > MAX_STEPS_PER_EPOCH:
+                break
+
+            X = X.to(device, non_blocking=True)
+            v1 = make_view(X)
+            v2 = make_view(X)
+
+            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+                # online
+                z1_o, q1 = model.forward_online(v1)
+                z2_o, q2 = model.forward_online(v2)
+                # target (stop-grad)
+                with torch.no_grad():
+                    z1_t = model.forward_target(v1)
+                    z2_t = model.forward_target(v2)
+
+                loss = 0.5 * (byol_cosine_loss(q1, z2_t) + byol_cosine_loss(q2, z1_t))
+
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            # EMA update
+            m = momentum_schedule(MOMENTUM_BASE, global_step, total_steps)
+            model.update_momentum(m)
+
+            scheduler.step()
+            running += loss.item()
+            global_step += 1
+
+            if it % LOG_EVERY == 0 or it == 1:
+                lr = scheduler.get_last_lr()[0]
+                print(f"epoch {ep:02d} | step {it:05d}/{steps_per_epoch:05d} | lr {lr:.3e} | loss {running/it:.4f} | m {m:.5f}")
+
+        # ---- Save checkpoint ----
+        # Full state (BYOL)
+        ckpt = {
+            "epoch": ep,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "hparams": {
+                "emb": EMB_DIM, "proj": PROJ_DIM,
+                "batch_size": BATCH_SIZE, "lr": LR, "weight_decay": WEIGHT_DECAY,
+                "backbone": "EEGNetv4", "ssl": "BYOL", "momentum_base": MOMENTUM_BASE,
+                "win_sec_ssl": WIN_SEC_SSL, "stride_sec": STRIDE_SEC,
+            },
+        }
+        torch.save(ckpt, SAVE_DIR / f"byol_sus_epoch{ep:03d}.pt")
+        torch.save(ckpt, SAVE_DIR / "byol_sus_latest.pt")
+
+        encoder_only = {}
+        for k, v in model.online_encoder.backbone.state_dict().items():
+            encoder_only["encoder.backbone." + k] = v
+        torch.save({"model": encoder_only}, SAVE_DIR / "simclr_encoder_only.pt")  
+
+        print(f"[ckpt] saved → {SAVE_DIR / f'byol_sus_epoch{ep:03d}.pt'}")
+
+    print("Training complete.")
+
+# =========================
+# Main
+# =========================
+if __name__ == "__main__":
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    torch.set_num_threads(8)
+    torch.set_num_interop_threads(8)
+    train()

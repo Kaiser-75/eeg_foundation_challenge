@@ -22,7 +22,7 @@ RELEASES              = None          # e.g. ["R1","R2"] or None for all
 MAX_FILES             = None          # e.g. 500 to cap number of recordings, or None
 STRIDE_SEC            = 1.0           # SSL window stride (sec)
 
-EPOCHS                = 60
+EPOCHS                = 100
 BATCH_SIZE            = 64
 LR                    = 1e-3
 WEIGHT_DECAY          = 1e-4
@@ -36,7 +36,7 @@ LOG_EVERY             = 100
 SAVE_DIR              = Path("checkpoints")
 SEED                  = 42
 
-NUM_WORKERS           = 8
+NUM_WORKERS           = 22
 PERSISTENT_WORKERS    = True
 PREFETCH_FACTOR       = 4
 

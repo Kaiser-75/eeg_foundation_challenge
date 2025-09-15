@@ -1,3 +1,4 @@
 # Ignore the competition data folder
 competition_data/*
 __pycache__/
+checkpoints_ccd/*

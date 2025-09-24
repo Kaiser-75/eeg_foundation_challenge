@@ -1,6 +1,4 @@
-# train_supervised_c1.py
-from __future__ import annotations
-import os, math
+from __future__ import annotations import os, math, json
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Tuple, Dict, Optional
@@ -25,7 +23,7 @@ TRAIN_RELEASES      = ["R1","R2","R3","R4","R6","R7","R8","R9","R10","R11"]
 VAL_RELEASES        = ["R5"]
 TEST_RELEASES       = ["R12"]
 
-CCD_MODE            = "poststim"   # per rules, use stimulus-anchored POST windows (2s)
+CCD_MODE            = "poststim"   
 
 BATCH_SIZE          = 128
 NUM_WORKERS         = 8
@@ -49,6 +47,17 @@ LR_FT_HEADS         = 1e-3
 WEIGHT_DECAY        = 1e-4
 WARMUP_EPOCHS       = 1
 LOG_EVERY           = 100
+
+# =========================
+# JSON logging
+# =========================
+METRICS_JSON = SAVE_DIR / "metrics_c1.jsonl"
+
+def log_epoch_jsonl(path: Path, rec: dict) -> None:
+    """Append one JSON object per line (robust to crashes)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
 
 # =========================
 # Utils
@@ -235,18 +244,38 @@ def train():
     best_val = float("inf")
     for ep in range(1, EPOCHS_LINEAR + 1):
         model.train()
+        train_loss_sum = 0.0
+        train_steps = 0
         for it, batch in enumerate(train_loader, start=1):
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 bout = step_supervised(model, batch, device)
             scaler.scale(bout.loss).backward()
             scaler.step(opt); scaler.update(); sch.step()
+            train_loss_sum += float(bout.loss.item())
+            train_steps += 1
             if it % LOG_EVERY == 0 or it == 1:
                 print(f"[stage1] ep {ep:02d} it {it:05d} | loss {bout.loss.item():.4f}")
 
         val = evaluate(model, val_loader, device)
+        avg_train_loss = train_loss_sum / max(1, train_steps)
+        curr_lr = opt.param_groups[0]["lr"]
+
         print(f"[stage1][val] ep {ep:02d} | MAE {val['mae']:.4f} | RMSE {val['rmse']:.4f} | "
-              f"NRMSE {val['nrmse']:.4f} | R2 {val['r2']:.3f}")
+              f"NRMSE {val['nrmse']:.4f} | R2 {val['r2']:.3f} | train_loss {avg_train_loss:.4f}")
+
+        # JSON log
+        log_epoch_jsonl(METRICS_JSON, {
+            "stage": "linear",
+            "epoch": ep,
+            "train_loss": avg_train_loss,
+            "val_mae": val["mae"],
+            "val_rmse": val["rmse"],
+            "val_nrmse": val["nrmse"],
+            "val_r2": val["r2"],
+            "lr_head": curr_lr,
+        })
+
         if val["nrmse"] < best_val:
             best_val = val["nrmse"]
             torch.save({"model": model.state_dict(), "epoch": ep, "val": val}, SAVE_DIR / "ccd_best_linear.pt")
@@ -263,18 +292,40 @@ def train():
     best_val = float("inf")
     for ep in range(1, EPOCHS_FT + 1):
         model.train()
+        train_loss_sum = 0.0
+        train_steps = 0
         for it, batch in enumerate(train_loader, start=1):
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 bout = step_supervised(model, batch, device)
             scaler.scale(bout.loss).backward()
             scaler.step(opt); scaler.update(); sch.step()
+            train_loss_sum += float(bout.loss.item())
+            train_steps += 1
             if it % LOG_EVERY == 0 or it == 1:
                 print(f"[stage2] ep {ep:02d} it {it:05d} | loss {bout.loss.item():.4f}")
 
         val = evaluate(model, val_loader, device)
+        avg_train_loss = train_loss_sum / max(1, train_steps)
+        lr_backbone = opt.param_groups[0]["lr"]
+        lr_head     = opt.param_groups[1]["lr"]
+
         print(f"[stage2][val] ep {ep:02d} | MAE {val['mae']:.4f} | RMSE {val['rmse']:.4f} | "
-              f"NRMSE {val['nrmse']:.4f} | R2 {val['r2']:.3f}")
+              f"NRMSE {val['nrmse']:.4f} | R2 {val['r2']:.3f} | train_loss {avg_train_loss:.4f}")
+
+        # JSON log
+        log_epoch_jsonl(METRICS_JSON, {
+            "stage": "finetune",
+            "epoch": ep,
+            "train_loss": avg_train_loss,
+            "val_mae": val["mae"],
+            "val_rmse": val["rmse"],
+            "val_nrmse": val["nrmse"],
+            "val_r2": val["r2"],
+            "lr_backbone": lr_backbone,
+            "lr_head": lr_head,
+        })
+
         if val["nrmse"] < best_val:
             best_val = val["nrmse"]
             torch.save({"model": model.state_dict(), "epoch": ep, "val": val}, SAVE_DIR / "ccd_best_finetune.pt")
@@ -286,6 +337,14 @@ def train():
         model.load_state_dict(best_state["model"])
         test = evaluate(model, test_loader, device)
         print(f"[test] MAE {test['mae']:.4f} | RMSE {test['rmse']:.4f} | NRMSE {test['nrmse']:.4f} | R2 {test['r2']:.3f}")
+        log_epoch_jsonl(METRICS_JSON, {
+            "stage": "test",
+            "epoch": None,
+            "test_mae": test["mae"],
+            "test_rmse": test["rmse"],
+            "test_nrmse": test["nrmse"],
+            "test_r2": test["r2"],
+        })
 
 # =========================
 # Main

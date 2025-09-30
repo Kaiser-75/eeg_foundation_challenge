@@ -1,0 +1,27 @@
+>>>>Starting
+[CCDWindowDataset] files=597  mode=poststim  win=2.0s
+   - competition_data/R1/sub-NDARAC904DMU/eeg/sub-NDARAC904DMU_task-contrastChangeDetection_run-1_eeg.bdf
+   - competition_data/R1/sub-NDARAC904DMU/eeg/sub-NDARAC904DMU_task-contrastChangeDetection_run-2_eeg.bdf
+   - competition_data/R1/sub-NDARAC904DMU/eeg/sub-NDARAC904DMU_task-contrastChangeDetection_run-3_eeg.bdf
+   - competition_data/R1/sub-NDARAM704GKZ/eeg/sub-NDARAM704GKZ_task-contrastChangeDetection_run-1_eeg.bdf
+   - competition_data/R1/sub-NDARAM704GKZ/eeg/sub-NDARAM704GKZ_task-contrastChangeDetection_run-2_eeg.bdf
+   - competition_data/R1/sub-NDARAM704GKZ/eeg/sub-NDARAM704GKZ_task-contrastChangeDetection_run-3_eeg.bdf
+   - competition_data/R1/sub-NDARAP359UM6/eeg/sub-NDARAP359UM6_task-contrastChangeDetection_run-1_eeg.bdf
+   - competition_data/R1/sub-NDARAP359UM6/eeg/sub-NDARAP359UM6_task-contrastChangeDetection_run-2_eeg.bdf
+[CCDWindowDataset] built windows=12805 | skipped: no_events_files=0, no_trial_files=0, trials_no_button=2505
+[CCDWindowDataset] files=60  mode=poststim  win=2.0s
+   - competition_data/R5/sub-NDARAH793FBF/eeg/sub-NDARAH793FBF_task-contrastChangeDetection_run-1_eeg.bdf
+   - competition_data/R5/sub-NDARAH793FBF/eeg/sub-NDARAH793FBF_task-contrastChangeDetection_run-2_eeg.bdf
+   - competition_data/R5/sub-NDARAH793FBF/eeg/sub-NDARAH793FBF_task-contrastChangeDetection_run-3_eeg.bdf
+   - competition_data/R5/sub-NDARAJ689BVN/eeg/sub-NDARAJ689BVN_task-contrastChangeDetection_run-1_eeg.bdf
+   - competition_data/R5/sub-NDARAJ689BVN/eeg/sub-NDARAJ689BVN_task-contrastChangeDetection_run-2_eeg.bdf
+   - competition_data/R5/sub-NDARAJ689BVN/eeg/sub-NDARAJ689BVN_task-contrastChangeDetection_run-3_eeg.bdf
+   - competition_data/R5/sub-NDARAP785CTE/eeg/sub-NDARAP785CTE_task-contrastChangeDetection_run-1_eeg.bdf
+   - competition_data/R5/sub-NDARAP785CTE/eeg/sub-NDARAP785CTE_task-contrastChangeDetection_run-2_eeg.bdf
+[CCDWindowDataset] built windows=1214 | skipped: no_events_files=0, no_trial_files=0, trials_no_button=226
+[CCDWindowDataset] files=0  mode=poststim  win=2.0s
+[CCDWindowDataset] built windows=0 | skipped: no_events_files=0, no_trial_files=0, trials_no_button=0
+[C1] Supervised on CCD (poststim) | device=cuda
+[ckpt] WARNING: checkpoints_c1/simclr_sus_latest.pt not found → training from scratch.
+[stage1] ep 01 it 00001 | loss 2.7253
+[stage1] ep 01 it 00100 | loss 0.3418

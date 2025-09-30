@@ -1,0 +1,12 @@
+>>>>Starting
+[SuSWindowDataset] files=438  win=6.0s stride=3.0s
+   - /scratch/ssoumma/codes/eeg_foundation_challenge/competition_data/R1/sub-NDARAC904DMU/eeg/sub-NDARAC904DMU_task-surroundSupp_run-1_eeg.bdf
+   - /scratch/ssoumma/codes/eeg_foundation_challenge/competition_data/R1/sub-NDARAC904DMU/eeg/sub-NDARAC904DMU_task-surroundSupp_run-2_eeg.bdf
+   - /scratch/ssoumma/codes/eeg_foundation_challenge/competition_data/R1/sub-NDARAM704GKZ/eeg/sub-NDARAM704GKZ_task-surroundSupp_run-1_eeg.bdf
+   - /scratch/ssoumma/codes/eeg_foundation_challenge/competition_data/R1/sub-NDARAM704GKZ/eeg/sub-NDARAM704GKZ_task-surroundSupp_run-2_eeg.bdf
+   - /scratch/ssoumma/codes/eeg_foundation_challenge/competition_data/R1/sub-NDARAP359UM6/eeg/sub-NDARAP359UM6_task-surroundSupp_run-1_eeg.bdf
+   - /scratch/ssoumma/codes/eeg_foundation_challenge/competition_data/R1/sub-NDARAP359UM6/eeg/sub-NDARAP359UM6_task-surroundSupp_run-2_eeg.bdf
+   - /scratch/ssoumma/codes/eeg_foundation_challenge/competition_data/R1/sub-NDARBD879MBX/eeg/sub-NDARBD879MBX_task-surroundSupp_run-1_eeg.bdf
+   - /scratch/ssoumma/codes/eeg_foundation_challenge/competition_data/R1/sub-NDARBD879MBX/eeg/sub-NDARBD879MBX_task-surroundSupp_run-2_eeg.bdf
+[SuSWindowDataset] files=438  win=6.0s stride=3.0s
+[C1] SimCLR SSL on SuS | windows=51653 | T_model=600 | device=cuda

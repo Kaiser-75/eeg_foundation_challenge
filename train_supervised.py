@@ -1,4 +1,5 @@
-from __future__ import annotations import os, math, json
+from __future__ import annotations 
+import os, math, json
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Tuple, Dict, Optional
@@ -26,7 +27,7 @@ TEST_RELEASES       = ["R12"]
 CCD_MODE            = "poststim"   
 
 BATCH_SIZE          = 128
-NUM_WORKERS         = 8
+NUM_WORKERS         = 20
 PIN_MEMORY          = torch.cuda.is_available()
 PERSISTENT_WORKERS  = True
 PREFETCH_FACTOR     = 4
@@ -39,8 +40,8 @@ DROPOUT             = 0.10
 
 # training
 SEED                = 42
-EPOCHS_LINEAR       = 3     # freeze encoder (linear probe)
-EPOCHS_FT           = 7     # unfreeze encoder (finetune)
+EPOCHS_LINEAR       = 7     # freeze encoder (linear probe)
+EPOCHS_FT           = 12     # unfreeze encoder (finetune)
 LR_LINEAR           = 1e-3
 LR_FT_BACKBONE      = 5e-5
 LR_FT_HEADS         = 1e-3

@@ -1,4 +1,5 @@
-from __future__ import annotations 
+# train_supervised.py
+from __future__ import annotations
 import os, math, json
 from pathlib import Path
 from dataclasses import dataclass
@@ -17,14 +18,14 @@ from dataloader import CCDWindowDataset, PreprocessConfig, MAX_CH, OUT_T
 # Hyperparameters
 # =========================
 BASE_DIR            = Path(os.environ.get("EEG_BASE_DIR", "competition_data"))
-PRETRAINED_CKPT     = Path("checkpoints_c1/simclr_sus_latest.pt")
+PRETRAINED_CKPT     = Path("checkpoints/simclr_sus_latest.pt")
 SAVE_DIR            = Path("checkpoints_c1_supervised")
 
 TRAIN_RELEASES      = ["R1","R2","R3","R4","R6","R7","R8","R9","R10","R11"]
-VAL_RELEASES        = ["R5"]
-TEST_RELEASES       = ["R12"]
+VAL_RELEASES        = ["R5"]      # must exist
+TEST_RELEASES       = ["R12"]     # optional
 
-CCD_MODE            = "poststim"   
+CCD_MODE            = "poststim"   # stimulus-anchored POST windows (2s)
 
 BATCH_SIZE          = 128
 NUM_WORKERS         = 20
@@ -55,7 +56,6 @@ LOG_EVERY           = 100
 METRICS_JSON = SAVE_DIR / "metrics_c1.jsonl"
 
 def log_epoch_jsonl(path: Path, rec: dict) -> None:
-    """Append one JSON object per line (robust to crashes)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
@@ -85,7 +85,7 @@ def cosine_lr(optimizer, base_lr: float, epochs: int, steps_per_epoch: int, warm
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 # =========================
-# Collate (RT only)
+# Collate
 # =========================
 def collate_supervised(batch):
     xs, rts = [], []
@@ -115,18 +115,22 @@ def build_loaders() -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
     ds_test  = CCDWindowDataset(base_dir=BASE_DIR, releases=TEST_RELEASES, mode=CCD_MODE,
                                 preprocess=cfg, preload=PRELOAD, verbose="INFO")
 
-    def _make_loader(d, shuffle: bool):
+    def _make_loader(d, shuffle: bool, drop_last: bool):
         kwargs = dict(
             batch_size=BATCH_SIZE, shuffle=shuffle,
             num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
-            drop_last=True, collate_fn=collate_supervised
+            drop_last=drop_last, collate_fn=collate_supervised
         )
         if NUM_WORKERS > 0:
             kwargs["persistent_workers"] = PERSISTENT_WORKERS
             kwargs["prefetch_factor"] = PREFETCH_FACTOR
         return DataLoader(d, **kwargs)
 
-    return _make_loader(ds_train, True), _make_loader(ds_val, False), _make_loader(ds_test, False)
+    return (
+        _make_loader(ds_train, True,  True),   # train must drop_last
+        _make_loader(ds_val,   False, False),  # val always kept
+        _make_loader(ds_test,  False, False),  # test 
+    )
 
 # =========================
 # Encoder (EEGNetv4) + RT head
@@ -136,10 +140,10 @@ class EEGV4Encoder(nn.Module):
         super().__init__()
         self.backbone = EEGNetv4(n_chans=in_ch, n_outputs=emb, n_times=T)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.backbone(x)  # usually [B, EMB_DIM], but some versions may output [B, EMB_DIM, t']
+        h = self.backbone(x)
         if h.ndim == 3:
-            h = h.mean(-1)    # safe global average over time
-        return h              # [B, EMB_DIM]
+            h = h.mean(-1)
+        return h
 
 class CCDHeadRT(nn.Module):
     def __init__(self, emb: int = EMB_DIM, hid: int = HID_FC, dropout: float = DROPOUT):
@@ -147,7 +151,7 @@ class CCDHeadRT(nn.Module):
         self.trunk = nn.Sequential(
             nn.Linear(emb, hid), nn.GELU(), nn.Dropout(dropout),
         )
-        self.out_rt = nn.Linear(hid, 1)   # regression (seconds)
+        self.out_rt = nn.Linear(hid, 1)
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         x = self.trunk(h)
         return self.out_rt(x).squeeze(-1)
@@ -159,34 +163,43 @@ class CCDModel(nn.Module):
         self.head = CCDHeadRT(emb=emb, hid=HID_FC, dropout=DROPOUT)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.backbone(x)
-        return self.head(h)  # rt
+        return self.head(h)
 
+# =========================
+# Safe weight loader
+# =========================
 def load_simclr_encoder_weights(model: CCDModel, ckpt_path: Path):
-    """
-    Loads encoder weights saved by our SSL trainers.
-    Supports the following layouts in ckpt["model"]:
-      - "encoder.backbone.*" (preferred)
-      - "backbone.*"
-      - direct EEGNetv4 state_dict (matching keys)
-    """
     if not ckpt_path.exists():
         print(f"[ckpt] WARNING: {ckpt_path} not found → training from scratch.")
         return
+
     sd = torch.load(ckpt_path, map_location="cpu")
     state = sd.get("model", sd)
 
-    # Try multiple key styles
-    sub = {k.replace("encoder.backbone.", ""): v for k, v in state.items()
-           if k.startswith("encoder.backbone.")}
-    if not sub:
-        sub = {k.replace("backbone.", ""): v for k, v in state.items()
-               if k.startswith("backbone.")}
-    if not sub and isinstance(state, dict):
-        # maybe it's already the bare EEGNetv4 dict
-        sub = state
+    # Subdict mapping
+    if any(k.startswith("encoder.backbone.") for k in state.keys()):
+        state = {k.replace("encoder.backbone.", ""): v for k, v in state.items()
+                 if k.startswith("encoder.backbone.")}
+    elif any(k.startswith("backbone.") for k in state.keys()):
+        state = {k.replace("backbone.", ""): v for k, v in state.items()
+                 if k.startswith("backbone.")}
 
-    missing, unexpected = model.backbone.backbone.load_state_dict(sub, strict=False)
-    print(f"[ckpt] loaded backbone | missing={len(missing)} unexpected={len(unexpected)}")
+    target = model.backbone.backbone.state_dict()
+    filtered = {}
+    skipped_mismatch = []
+    for k, v in state.items():
+        if k not in target:
+            continue
+        if isinstance(v, torch.Tensor) and target[k].shape != v.shape:
+            skipped_mismatch.append((k, tuple(v.shape), tuple(target[k].shape)))
+            continue
+        filtered[k] = v
+
+    missing, unexpected = model.backbone.backbone.load_state_dict(filtered, strict=False)
+    print(f"[ckpt] loaded backbone | kept={len(filtered)} skipped_mismatch={len(skipped_mismatch)} "
+          f"missing_after_load={len(missing)} unexpected_after_load={len(unexpected)}")
+    if skipped_mismatch:
+        print(f"[ckpt] mismatched keys skipped (example): {skipped_mismatch[:2]}")
 
 # =========================
 # Train / Eval
@@ -207,6 +220,8 @@ def step_supervised(model: CCDModel, batch, device: torch.device) -> BatchOut:
 
 @torch.no_grad()
 def evaluate(model: CCDModel, loader: DataLoader, device: torch.device) -> Dict[str, float]:
+    if loader is None or len(loader) == 0:
+        return {}
     model.eval()
     rts, rts_pred = [], []
     for X, y in loader:
@@ -216,7 +231,6 @@ def evaluate(model: CCDModel, loader: DataLoader, device: torch.device) -> Dict[
         rts.append(y["rt"])
     y_rt = torch.cat(rts).numpy()
     p_rt = torch.cat(rts_pred).numpy()
-
     mae = float(mean_absolute_error(y_rt, p_rt))
     rmse = float(np.sqrt(np.mean((y_rt - p_rt) ** 2)))
     nrmse = float(rmse / (np.std(y_rt) + 1e-12))
@@ -229,6 +243,8 @@ def train():
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
     train_loader, val_loader, test_loader = build_loaders()
+    print(f"[sizes] train={len(train_loader)} val={len(val_loader)} test={len(test_loader)} batch={BATCH_SIZE}")
+    print(f"[epochs] linear={EPOCHS_LINEAR} finetune={EPOCHS_FT}")
     print(f"[C1] Supervised on CCD ({CCD_MODE}) | device={device.type}")
 
     model = CCDModel(in_ch=MAX_CH, T=OUT_T, emb=EMB_DIM).to(device)
@@ -236,7 +252,7 @@ def train():
 
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
-    # ---------- Stage 1: Linear probe (freeze encoder) ----------
+    # ---------- Stage 1: Linear probe ----------
     for p in model.backbone.parameters():
         p.requires_grad = False
     opt = AdamW(model.head.parameters(), lr=LR_LINEAR, weight_decay=WEIGHT_DECAY)
@@ -245,43 +261,26 @@ def train():
     best_val = float("inf")
     for ep in range(1, EPOCHS_LINEAR + 1):
         model.train()
-        train_loss_sum = 0.0
-        train_steps = 0
+        train_loss_sum, train_steps = 0.0, 0
         for it, batch in enumerate(train_loader, start=1):
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 bout = step_supervised(model, batch, device)
             scaler.scale(bout.loss).backward()
             scaler.step(opt); scaler.update(); sch.step()
-            train_loss_sum += float(bout.loss.item())
-            train_steps += 1
+            train_loss_sum += float(bout.loss.item()); train_steps += 1
             if it % LOG_EVERY == 0 or it == 1:
                 print(f"[stage1] ep {ep:02d} it {it:05d} | loss {bout.loss.item():.4f}")
-
         val = evaluate(model, val_loader, device)
         avg_train_loss = train_loss_sum / max(1, train_steps)
         curr_lr = opt.param_groups[0]["lr"]
-
-        print(f"[stage1][val] ep {ep:02d} | MAE {val['mae']:.4f} | RMSE {val['rmse']:.4f} | "
-              f"NRMSE {val['nrmse']:.4f} | R2 {val['r2']:.3f} | train_loss {avg_train_loss:.4f}")
-
-        # JSON log
-        log_epoch_jsonl(METRICS_JSON, {
-            "stage": "linear",
-            "epoch": ep,
-            "train_loss": avg_train_loss,
-            "val_mae": val["mae"],
-            "val_rmse": val["rmse"],
-            "val_nrmse": val["nrmse"],
-            "val_r2": val["r2"],
-            "lr_head": curr_lr,
-        })
-
-        if val["nrmse"] < best_val:
+        print(f"[stage1][val] ep {ep:02d} | {val} | train_loss {avg_train_loss:.4f}")
+        log_epoch_jsonl(METRICS_JSON, {"stage":"linear","epoch":ep,"train_loss":avg_train_loss,**val,"lr_head":curr_lr})
+        if val and val.get("nrmse", 1e9) < best_val:
             best_val = val["nrmse"]
-            torch.save({"model": model.state_dict(), "epoch": ep, "val": val}, SAVE_DIR / "ccd_best_linear.pt")
+            torch.save({"model": model.state_dict(),"epoch":ep,"val":val}, SAVE_DIR/"ccd_best_linear.pt")
 
-    # ---------- Stage 2: Finetune (unfreeze encoder) ----------
+    # ---------- Stage 2: Finetune ----------
     for p in model.backbone.parameters():
         p.requires_grad = True
     opt = AdamW([
@@ -293,59 +292,34 @@ def train():
     best_val = float("inf")
     for ep in range(1, EPOCHS_FT + 1):
         model.train()
-        train_loss_sum = 0.0
-        train_steps = 0
+        train_loss_sum, train_steps = 0.0, 0
         for it, batch in enumerate(train_loader, start=1):
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 bout = step_supervised(model, batch, device)
             scaler.scale(bout.loss).backward()
             scaler.step(opt); scaler.update(); sch.step()
-            train_loss_sum += float(bout.loss.item())
-            train_steps += 1
+            train_loss_sum += float(bout.loss.item()); train_steps += 1
             if it % LOG_EVERY == 0 or it == 1:
                 print(f"[stage2] ep {ep:02d} it {it:05d} | loss {bout.loss.item():.4f}")
-
         val = evaluate(model, val_loader, device)
         avg_train_loss = train_loss_sum / max(1, train_steps)
-        lr_backbone = opt.param_groups[0]["lr"]
-        lr_head     = opt.param_groups[1]["lr"]
-
-        print(f"[stage2][val] ep {ep:02d} | MAE {val['mae']:.4f} | RMSE {val['rmse']:.4f} | "
-              f"NRMSE {val['nrmse']:.4f} | R2 {val['r2']:.3f} | train_loss {avg_train_loss:.4f}")
-
-        # JSON log
-        log_epoch_jsonl(METRICS_JSON, {
-            "stage": "finetune",
-            "epoch": ep,
-            "train_loss": avg_train_loss,
-            "val_mae": val["mae"],
-            "val_rmse": val["rmse"],
-            "val_nrmse": val["nrmse"],
-            "val_r2": val["r2"],
-            "lr_backbone": lr_backbone,
-            "lr_head": lr_head,
-        })
-
-        if val["nrmse"] < best_val:
+        lr_backbone, lr_head = opt.param_groups[0]["lr"], opt.param_groups[1]["lr"]
+        print(f"[stage2][val] ep {ep:02d} | {val} | train_loss {avg_train_loss:.4f}")
+        log_epoch_jsonl(METRICS_JSON, {"stage":"finetune","epoch":ep,"train_loss":avg_train_loss,**val,
+                                       "lr_backbone":lr_backbone,"lr_head":lr_head})
+        if val and val.get("nrmse", 1e9) < best_val:
             best_val = val["nrmse"]
-            torch.save({"model": model.state_dict(), "epoch": ep, "val": val}, SAVE_DIR / "ccd_best_finetune.pt")
+            torch.save({"model": model.state_dict(),"epoch":ep,"val":val}, SAVE_DIR/"ccd_best_finetune.pt")
 
     # ---------- Test ----------
     best_path = SAVE_DIR / "ccd_best_finetune.pt"
-    if best_path.exists():
+    if best_path.exists() and test_loader is not None and len(test_loader) > 0:
         best_state = torch.load(best_path, map_location=device)
         model.load_state_dict(best_state["model"])
         test = evaluate(model, test_loader, device)
-        print(f"[test] MAE {test['mae']:.4f} | RMSE {test['rmse']:.4f} | NRMSE {test['nrmse']:.4f} | R2 {test['r2']:.3f}")
-        log_epoch_jsonl(METRICS_JSON, {
-            "stage": "test",
-            "epoch": None,
-            "test_mae": test["mae"],
-            "test_rmse": test["rmse"],
-            "test_nrmse": test["nrmse"],
-            "test_r2": test["r2"],
-        })
+        print(f"[test] {test}")
+        log_epoch_jsonl(METRICS_JSON, {"stage":"test","epoch":None,**test})
 
 # =========================
 # Main
